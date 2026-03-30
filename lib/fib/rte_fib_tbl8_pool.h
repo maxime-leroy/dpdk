@@ -131,6 +131,26 @@ int
 rte_fib_tbl8_pool_resize(struct rte_fib_tbl8_pool *pool,
 			 uint32_t new_num_tbl8);
 
+/**
+ * Retrieve tbl8 pool statistics.
+ *
+ * @param pool
+ *   Pool handle
+ * @param used
+ *   Number of tbl8 groups taken from the pool, including those waiting
+ *   in an RCU defer queue (can be NULL)
+ * @param total
+ *   Total number of tbl8 groups (current capacity, can be NULL)
+ * @param max
+ *   Maximum number of tbl8 groups (0 = fixed, can be NULL)
+ * @return
+ *   0 on success, -EINVAL if pool is NULL
+ */
+__rte_experimental
+int
+rte_fib_tbl8_pool_get_stats(struct rte_fib_tbl8_pool *pool,
+			    uint32_t *used, uint32_t *total, uint32_t *max);
+
 #ifdef __cplusplus
 }
 #endif

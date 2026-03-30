@@ -157,6 +157,9 @@ variable, attached with ``rte_fib_tbl8_pool_rcu_qsbr_add()``, or by the first
 The previous array is freed once the readers are done with it.
 The pool never shrinks.
 
+``rte_fib_tbl8_pool_get_stats()`` returns the number of tbl8 groups taken
+from the pool, its current capacity and its maximum capacity.
+
 The pool is not thread safe: the updates of all the FIBs sharing it,
 their creation and their destruction must be serialized by the caller.
 

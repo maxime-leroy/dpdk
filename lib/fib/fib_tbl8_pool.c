@@ -346,3 +346,20 @@ rte_fib_tbl8_pool_rcu_qsbr_add(struct rte_fib_tbl8_pool *pool,
 	pool->v = cfg->v;
 	return 0;
 }
+
+RTE_EXPORT_EXPERIMENTAL_SYMBOL(rte_fib_tbl8_pool_get_stats, 27.03)
+int
+rte_fib_tbl8_pool_get_stats(struct rte_fib_tbl8_pool *pool,
+			    uint32_t *used, uint32_t *total, uint32_t *max)
+{
+	if (pool == NULL)
+		return -EINVAL;
+
+	if (used != NULL)
+		*used = pool->pool_pos;
+	if (total != NULL)
+		*total = pool->num_tbl8s;
+	if (max != NULL)
+		*max = pool->max_tbl8s;
+	return 0;
+}
