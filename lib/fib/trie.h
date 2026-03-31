@@ -11,7 +11,7 @@
 #include <rte_common.h>
 #include <rte_fib6.h>
 
-#include "fib_tbl8.h"
+#include "fib_tbl8_pool.h"
 
 /**
  * @file
@@ -26,18 +26,16 @@
 #define TRIE_EXT_ENT		1
 
 struct rte_trie_tbl {
-	uint32_t	number_tbl8s;	/**< Total number of tbl8s */
 	uint32_t	rsvd_tbl8s;	/**< Number of reserved tbl8s */
-	uint32_t	cur_tbl8s;	/**< Current cumber of tbl8s */
 	uint64_t	def_nh;		/**< Default next hop */
 	enum rte_fib_trie_nh_sz	nh_sz;	/**< Size of nexthop entry */
 	uint64_t	*tbl8;		/**< tbl8 table. */
-	uint32_t	*tbl8_pool;	/**< bitmap containing free tbl8 idxes*/
-	uint32_t	tbl8_pool_pos;
+	struct rte_fib_tbl8_pool *pool;	/**< tbl8 pool */
 	/* RCU config. */
 	enum rte_fib6_qsbr_mode rcu_mode; /**< Blocking, defer queue. */
 	struct rte_rcu_qsbr *v; /**< RCU QSBR variable. */
 	struct rte_rcu_qsbr_dq *dq; /**< RCU QSBR defer queue. */
+	struct fib_tbl8_consumer consumer; /**< Link in the tbl8 pool */
 	/* tbl24 table. */
 	alignas(RTE_CACHE_LINE_SIZE) uint64_t	tbl24[];
 };

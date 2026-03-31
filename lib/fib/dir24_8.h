@@ -14,7 +14,7 @@
 #include <rte_branch_prediction.h>
 #include <rte_rcu_qsbr.h>
 
-#include "fib_tbl8.h"
+#include "fib_tbl8_pool.h"
 
 /**
  * @file
@@ -26,9 +26,7 @@
 #define DIR24_8_TBL24_MASK		0xffffff00
 
 struct dir24_8_tbl {
-	uint32_t	number_tbl8s;	/**< Total number of tbl8s */
 	uint32_t	rsvd_tbl8s;	/**< Number of reserved tbl8s */
-	uint32_t	tbl8_pool_pos;	/**< Next free index in pool */
 	enum rte_fib_dir24_8_nh_sz	nh_sz;	/**< Size of nexthop entry */
 	/* RCU config. */
 	enum rte_fib_qsbr_mode rcu_mode;/* Blocking, defer queue. */
@@ -36,7 +34,8 @@ struct dir24_8_tbl {
 	struct rte_rcu_qsbr_dq *dq;	/* RCU QSBR defer queue. */
 	uint64_t	def_nh;		/**< Default next hop */
 	uint64_t	*tbl8;		/**< tbl8 table. */
-	uint32_t	*tbl8_pool;	/**< Stack of free tbl8 indices */
+	struct rte_fib_tbl8_pool *pool;	/**< tbl8 pool */
+	struct fib_tbl8_consumer consumer; /**< Link in the tbl8 pool */
 	/* tbl24 table. */
 	alignas(RTE_CACHE_LINE_SIZE) uint64_t	tbl24[];
 };

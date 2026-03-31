@@ -151,7 +151,8 @@ The public API headers are grouped by topics:
   [RIB IPv4](@ref rte_rib.h),
   [RIB IPv6](@ref rte_rib6.h),
   [FIB IPv4](@ref rte_fib.h),
-  [FIB IPv6](@ref rte_fib6.h)
+  [FIB IPv6](@ref rte_fib6.h),
+  [FIB tbl8 pool](@ref rte_fib_tbl8_pool.h)
 
 - **hashes**:
   [hash](@ref rte_hash.h),

@@ -127,6 +127,32 @@ An entry in a tbl8 contains the following fields:
 * 1 bit indicating if the lookup should proceed inside the tbl8.
 
 
+tbl8 pool
+---------
+
+The tbl8 groups of the DIR-24-8 and TRIE algorithms come from a tbl8 pool.
+By default each FIB creates its own pool of ``num_tbl8`` groups.
+
+A pool can also be created with ``rte_fib_tbl8_pool_create()`` and given in the
+``tbl8_pool`` field of the configuration of several FIBs, IPv4 or IPv6,
+using the same next hop size. These FIBs then share the groups of the pool,
+for example with one FIB per VRF: a FIB with few long prefixes leaves room
+to the others.
+
+Each route reserves in the pool the tbl8 groups it may need.
+An add is refused with ``-ENOSPC`` when the reservations of all the FIBs
+of the pool would exceed its capacity, so that an accepted route never fails
+later for lack of tbl8 groups.
+Freeing a FIB returns its groups and its reservation to the pool.
+When the pool is shared and the FIB has an RCU defer queue,
+``rte_fib_free()`` and ``rte_fib6_free()`` first wait for the readers
+to report a quiescent state, so that the groups waiting in the queue
+also return to the pool.
+
+The pool is not thread safe: the updates of all the FIBs sharing it,
+their creation and their destruction must be serialized by the caller.
+
+
 Use cases
 ---------
 

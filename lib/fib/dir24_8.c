@@ -152,41 +152,18 @@ dir24_8_get_lookup_fn(void *p, enum rte_fib_lookup_type type, bool be_addr)
 	return NULL;
 }
 
-/*
- * Get an index of a free tbl8 from the pool
- */
-static inline int32_t
-tbl8_get(struct dir24_8_tbl *dp)
-{
-	if (dp->tbl8_pool_pos == dp->number_tbl8s)
-		/* no more free tbl8 */
-		return -ENOSPC;
-
-	/* next index */
-	return dp->tbl8_pool[dp->tbl8_pool_pos++];
-}
-
-/*
- * Put an index of a free tbl8 back to the pool
- */
-static inline void
-tbl8_put(struct dir24_8_tbl *dp, uint32_t tbl8_ind)
-{
-	dp->tbl8_pool[--dp->tbl8_pool_pos] = tbl8_ind;
-}
-
 static int
 tbl8_alloc(struct dir24_8_tbl *dp, uint64_t nh)
 {
 	int64_t	tbl8_idx;
 	uint8_t	*tbl8_ptr;
 
-	tbl8_idx = tbl8_get(dp);
+	tbl8_idx = fib_tbl8_pool_get(dp->pool);
 
 	/* If there are no tbl8 groups try to reclaim one. */
-	if (unlikely(tbl8_idx == -ENOSPC && dp->dq &&
-			!rte_rcu_qsbr_dq_reclaim(dp->dq, 1, NULL, NULL, NULL)))
-		tbl8_idx = tbl8_get(dp);
+	if (unlikely(tbl8_idx == -ENOSPC &&
+			fib_tbl8_pool_reclaim(dp->pool, 1) != 0))
+		tbl8_idx = fib_tbl8_pool_get(dp->pool);
 
 	if (tbl8_idx < 0)
 		return tbl8_idx;
@@ -197,25 +174,8 @@ tbl8_alloc(struct dir24_8_tbl *dp, uint64_t nh)
 	fib_tbl8_write((void *)tbl8_ptr, nh|
 		DIR24_8_EXT_ENT, dp->nh_sz,
 		FIB_TBL8_GRP_NUM_ENT);
+	dp->pool->cur_tbl8s++;
 	return tbl8_idx;
-}
-
-static void
-tbl8_cleanup_and_free(struct dir24_8_tbl *dp, uint64_t tbl8_idx)
-{
-	uint8_t *ptr = (uint8_t *)dp->tbl8 + (tbl8_idx * FIB_TBL8_GRP_NUM_ENT << dp->nh_sz);
-
-	memset(ptr, 0, FIB_TBL8_GRP_NUM_ENT << dp->nh_sz);
-	tbl8_put(dp, tbl8_idx);
-}
-
-static void
-__rcu_qsbr_free_resource(void *p, void *data, unsigned int n __rte_unused)
-{
-	struct dir24_8_tbl *dp = p;
-	uint64_t tbl8_idx = *(uint64_t *)data;
-
-	tbl8_cleanup_and_free(dp, tbl8_idx);
 }
 
 static void
@@ -275,11 +235,12 @@ tbl8_recycle(struct dir24_8_tbl *dp, uint32_t ip, uint64_t tbl8_idx)
 		break;
 	}
 
+	dp->pool->cur_tbl8s--;
 	if (dp->v == NULL) {
-		tbl8_cleanup_and_free(dp, tbl8_idx);
+		fib_tbl8_pool_cleanup_and_free(dp->pool, tbl8_idx);
 	} else if (dp->rcu_mode == RTE_FIB_QSBR_MODE_SYNC) {
 		rte_rcu_qsbr_synchronize(dp->v, RTE_QSBR_THRID_INVALID);
-		tbl8_cleanup_and_free(dp, tbl8_idx);
+		fib_tbl8_pool_cleanup_and_free(dp->pool, tbl8_idx);
 	} else { /* RTE_FIB_QSBR_MODE_DQ */
 		if (rte_rcu_qsbr_dq_enqueue(dp->dq, &tbl8_idx))
 			FIB_LOG(ERR, "Failed to push QSBR FIFO");
@@ -310,14 +271,15 @@ install_to_fib(struct dir24_8_tbl *dp, uint32_t ledge, uint32_t redge,
 				 * needs tbl8 for ledge and redge.
 				 */
 				tbl8_idx = tbl8_alloc(dp, tbl24_tmp);
-				tmp_tbl8_idx = tbl8_get(dp);
+				tmp_tbl8_idx = fib_tbl8_pool_get(dp->pool);
 				if (tbl8_idx < 0)
 					return -ENOSPC;
 				else if (tmp_tbl8_idx < 0) {
-					tbl8_put(dp, tbl8_idx);
+					dp->pool->cur_tbl8s--;
+					fib_tbl8_pool_cleanup_and_free(dp->pool, tbl8_idx);
 					return -ENOSPC;
 				}
-				tbl8_put(dp, tmp_tbl8_idx);
+				fib_tbl8_pool_put(dp->pool, tmp_tbl8_idx);
 				/*update dir24 entry with tbl8 index*/
 				fib_tbl8_write(get_tbl24_p(dp, ledge,
 					dp->nh_sz), (tbl8_idx << 1)|
@@ -483,7 +445,7 @@ dir24_8_modify(struct rte_fib *fib, uint32_t ip, uint8_t depth,
 			tmp = rte_rib_get_nxt(rib, ip, 24, NULL,
 				RTE_RIB_GET_NXT_COVER);
 			if ((tmp == NULL) &&
-				(dp->rsvd_tbl8s >= dp->number_tbl8s))
+				(dp->pool->rsvd_tbl8s >= dp->pool->num_tbl8s))
 				return -ENOSPC;
 
 		}
@@ -503,8 +465,10 @@ dir24_8_modify(struct rte_fib *fib, uint32_t ip, uint8_t depth,
 			return ret;
 		}
 successfully_added:
-		if ((depth > 24) && (tmp == NULL))
+		if ((depth > 24) && (tmp == NULL)) {
 			dp->rsvd_tbl8s++;
+			dp->pool->rsvd_tbl8s++;
+		}
 		return 0;
 	case RTE_FIB_DEL:
 		if (node == NULL)
@@ -523,8 +487,10 @@ successfully_added:
 			if (depth > 24) {
 				tmp = rte_rib_get_nxt(rib, ip, 24, NULL,
 					RTE_RIB_GET_NXT_COVER);
-				if (tmp == NULL)
+				if (tmp == NULL) {
 					dp->rsvd_tbl8s--;
+					dp->pool->rsvd_tbl8s--;
+				}
 			}
 		}
 		return ret;
@@ -539,18 +505,13 @@ dir24_8_create(const char *name, int socket_id, struct rte_fib_conf *fib_conf)
 {
 	char mem_name[DIR24_8_NAMESIZE];
 	struct dir24_8_tbl *dp;
+	struct rte_fib_tbl8_pool *pool;
 	uint64_t	def_nh;
-	uint64_t	tbl8_sz;
-	uint32_t	num_tbl8;
-	uint32_t	i;
 	enum rte_fib_dir24_8_nh_sz	nh_sz;
 
 	if ((name == NULL) || (fib_conf == NULL) ||
 			(fib_conf->dir24_8.nh_sz < RTE_FIB_DIR24_8_1B) ||
 			(fib_conf->dir24_8.nh_sz > RTE_FIB_DIR24_8_8B) ||
-			(fib_conf->dir24_8.num_tbl8 >
-			get_max_nh(fib_conf->dir24_8.nh_sz)) ||
-			(fib_conf->dir24_8.num_tbl8 == 0) ||
 			(fib_conf->default_nh >
 			get_max_nh(fib_conf->dir24_8.nh_sz))) {
 		rte_errno = EINVAL;
@@ -559,46 +520,49 @@ dir24_8_create(const char *name, int socket_id, struct rte_fib_conf *fib_conf)
 
 	def_nh = fib_conf->default_nh;
 	nh_sz = fib_conf->dir24_8.nh_sz;
-	num_tbl8 = fib_conf->dir24_8.num_tbl8;
+
+	if (fib_conf->dir24_8.tbl8_pool != NULL) {
+		/* External shared pool */
+		pool = fib_conf->dir24_8.tbl8_pool;
+		if (pool->nh_sz != nh_sz) {
+			rte_errno = EINVAL;
+			return NULL;
+		}
+		fib_tbl8_pool_ref(pool);
+	} else {
+		/* Internal pool */
+		if ((fib_conf->dir24_8.num_tbl8 >
+		     get_max_nh(fib_conf->dir24_8.nh_sz)) ||
+		    (fib_conf->dir24_8.num_tbl8 == 0)) {
+			rte_errno = EINVAL;
+			return NULL;
+		}
+		struct rte_fib_tbl8_pool_conf pool_conf = {
+			.num_tbl8 = fib_conf->dir24_8.num_tbl8,
+			.nh_sz = nh_sz,
+			.socket_id = socket_id,
+		};
+		pool = rte_fib_tbl8_pool_create(name, &pool_conf);
+		if (pool == NULL)
+			return NULL;
+	}
 
 	snprintf(mem_name, sizeof(mem_name), "DP_%s", name);
 	dp = rte_zmalloc_socket(name, sizeof(struct dir24_8_tbl) +
 		DIR24_8_TBL24_NUM_ENT * (1 << nh_sz) + sizeof(uint32_t),
 		RTE_CACHE_LINE_SIZE, socket_id);
 	if (dp == NULL) {
+		fib_tbl8_pool_unref(pool);
 		rte_errno = ENOMEM;
 		return NULL;
 	}
 
-	snprintf(mem_name, sizeof(mem_name), "TBL8_%p", dp);
-	tbl8_sz = FIB_TBL8_GRP_NUM_ENT * (1ULL << nh_sz) *
-			(num_tbl8 + 1);
-	dp->tbl8 = rte_zmalloc_socket(mem_name, tbl8_sz,
-			RTE_CACHE_LINE_SIZE, socket_id);
-	if (dp->tbl8 == NULL) {
-		rte_errno = ENOMEM;
-		rte_free(dp);
-		return NULL;
-	}
+	dp->pool = pool;
+	dp->tbl8 = pool->tbl8;
 	dp->def_nh = def_nh;
 	dp->nh_sz = nh_sz;
-	dp->number_tbl8s = num_tbl8;
-
-	snprintf(mem_name, sizeof(mem_name), "TBL8_idxes_%p", dp);
-	dp->tbl8_pool = rte_zmalloc_socket(mem_name,
-			sizeof(uint32_t) * dp->number_tbl8s,
-			RTE_CACHE_LINE_SIZE, socket_id);
-	if (dp->tbl8_pool == NULL) {
-		rte_errno = ENOMEM;
-		rte_free(dp->tbl8);
-		rte_free(dp);
-		return NULL;
-	}
-
-	/* Init pool with all tbl8 indices free */
-	for (i = 0; i < dp->number_tbl8s; i++)
-		dp->tbl8_pool[i] = i;
-	dp->tbl8_pool_pos = 0;
+	dp->consumer.dq = &dp->dq;
+	fib_tbl8_pool_register(pool, &dp->consumer);
 
 	/* Init table with default value */
 	fib_tbl8_write(dp->tbl24, (def_nh << 1), nh_sz, 1 << 24);
@@ -610,10 +574,26 @@ void
 dir24_8_free(void *p)
 {
 	struct dir24_8_tbl *dp = (struct dir24_8_tbl *)p;
+	bool shared = dp->pool->refcnt > 1;
+	uint64_t val;
+	uint32_t i;
 
+	fib_tbl8_pool_unregister(dp->pool, &dp->consumer);
+	if (shared && dp->dq != NULL)
+		rte_rcu_qsbr_synchronize(dp->v, RTE_QSBR_THRID_INVALID);
 	rte_rcu_qsbr_dq_delete(dp->dq);
-	rte_free(dp->tbl8_pool);
-	rte_free(dp->tbl8);
+	if (shared) {
+		for (i = 0; i < DIR24_8_TBL24_NUM_ENT; i++) {
+			val = get_tbl24(dp, i << 8, dp->nh_sz);
+			if ((val & DIR24_8_EXT_ENT) == DIR24_8_EXT_ENT) {
+				dp->pool->cur_tbl8s--;
+				fib_tbl8_pool_cleanup_and_free(dp->pool,
+					val >> 1);
+			}
+		}
+		dp->pool->rsvd_tbl8s -= dp->rsvd_tbl8s;
+	}
+	fib_tbl8_pool_unref(dp->pool);
 	rte_free(dp);
 }
 
@@ -645,8 +625,8 @@ dir24_8_rcu_qsbr_add(struct dir24_8_tbl *dp, struct rte_fib_rcu_config *cfg,
 		if (params.max_reclaim_size == 0)
 			params.max_reclaim_size = RTE_FIB_RCU_DQ_RECLAIM_MAX;
 		params.esize = sizeof(uint64_t);
-		params.free_fn = __rcu_qsbr_free_resource;
-		params.p = dp;
+		params.free_fn = fib_tbl8_pool_rcu_free_cb;
+		params.p = dp->pool;
 		params.v = cfg->v;
 		dp->dq = rte_rcu_qsbr_dq_create(&params);
 		if (dp->dq == NULL) {

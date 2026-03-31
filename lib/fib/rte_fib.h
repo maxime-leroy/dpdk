@@ -19,6 +19,7 @@
 
 #include <rte_common.h>
 #include <rte_rcu_qsbr.h>
+#include <rte_fib_tbl8_pool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -107,6 +108,8 @@ struct rte_fib_conf {
 		struct {
 			enum rte_fib_dir24_8_nh_sz nh_sz;
 			uint32_t	num_tbl8;
+			/** Shared tbl8 pool (NULL = internal pool) */
+			struct rte_fib_tbl8_pool *tbl8_pool;
 		} dir24_8;
 	};
 	unsigned int flags; /**< Optional feature flags from RTE_FIB_F_* */

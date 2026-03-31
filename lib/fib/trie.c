@@ -100,53 +100,18 @@ trie_get_lookup_fn(void *p, enum rte_fib6_lookup_type type)
 	return NULL;
 }
 
-static void
-tbl8_pool_init(struct rte_trie_tbl *dp)
-{
-	uint32_t i;
-
-	/* put entire range of indexes to the tbl8 pool */
-	for (i = 0; i < dp->number_tbl8s; i++)
-		dp->tbl8_pool[i] = i;
-
-	dp->tbl8_pool_pos = 0;
-}
-
-/*
- * Get an index of a free tbl8 from the pool
- */
-static inline int32_t
-tbl8_get(struct rte_trie_tbl *dp)
-{
-	if (dp->tbl8_pool_pos == dp->number_tbl8s)
-		/* no more free tbl8 */
-		return -ENOSPC;
-
-	/* next index */
-	return dp->tbl8_pool[dp->tbl8_pool_pos++];
-}
-
-/*
- * Put an index of a free tbl8 back to the pool
- */
-static inline void
-tbl8_put(struct rte_trie_tbl *dp, uint32_t tbl8_ind)
-{
-	dp->tbl8_pool[--dp->tbl8_pool_pos] = tbl8_ind;
-}
-
 static int
 tbl8_alloc(struct rte_trie_tbl *dp, uint64_t nh)
 {
 	int64_t		tbl8_idx;
 	uint8_t		*tbl8_ptr;
 
-	tbl8_idx = tbl8_get(dp);
+	tbl8_idx = fib_tbl8_pool_get(dp->pool);
 
 	/* If there are no tbl8 groups try to reclaim one. */
-	if (unlikely(tbl8_idx == -ENOSPC && dp->dq &&
-			!rte_rcu_qsbr_dq_reclaim(dp->dq, 1, NULL, NULL, NULL)))
-		tbl8_idx = tbl8_get(dp);
+	if (unlikely(tbl8_idx == -ENOSPC &&
+			fib_tbl8_pool_reclaim(dp->pool, 1) != 0))
+		tbl8_idx = fib_tbl8_pool_get(dp->pool);
 
 	if (tbl8_idx < 0)
 		return tbl8_idx;
@@ -155,25 +120,8 @@ tbl8_alloc(struct rte_trie_tbl *dp, uint64_t nh)
 	/*Init tbl8 entries with nexthop from tbl24*/
 	fib_tbl8_write((void *)tbl8_ptr, nh, dp->nh_sz,
 		FIB_TBL8_GRP_NUM_ENT);
-	dp->cur_tbl8s++;
+	dp->pool->cur_tbl8s++;
 	return tbl8_idx;
-}
-
-static void
-tbl8_cleanup_and_free(struct rte_trie_tbl *dp, uint64_t tbl8_idx)
-{
-	uint8_t *ptr = (uint8_t *)dp->tbl8 + (tbl8_idx * FIB_TBL8_GRP_NUM_ENT << dp->nh_sz);
-
-	memset(ptr, 0, FIB_TBL8_GRP_NUM_ENT << dp->nh_sz);
-	tbl8_put(dp, tbl8_idx);
-}
-
-static void
-__rcu_qsbr_free_resource(void *p, void *data, unsigned int n __rte_unused)
-{
-	struct rte_trie_tbl *dp = p;
-	uint64_t tbl8_idx = *(uint64_t *)data;
-	tbl8_cleanup_and_free(dp, tbl8_idx);
 }
 
 static void
@@ -224,12 +172,12 @@ tbl8_recycle(struct rte_trie_tbl *dp, void *par, uint64_t tbl8_idx)
 		break;
 	}
 
-	dp->cur_tbl8s--;
+	dp->pool->cur_tbl8s--;
 	if (dp->v == NULL) {
-		tbl8_cleanup_and_free(dp, tbl8_idx);
+		fib_tbl8_pool_cleanup_and_free(dp->pool, tbl8_idx);
 	} else if (dp->rcu_mode == RTE_FIB6_QSBR_MODE_SYNC) {
 		rte_rcu_qsbr_synchronize(dp->v, RTE_QSBR_THRID_INVALID);
-		tbl8_cleanup_and_free(dp, tbl8_idx);
+		fib_tbl8_pool_cleanup_and_free(dp->pool, tbl8_idx);
 	} else { /* RTE_FIB6_QSBR_MODE_DQ */
 		if (rte_rcu_qsbr_dq_enqueue(dp->dq, &tbl8_idx))
 			FIB_LOG(ERR, "Failed to push QSBR FIFO");
@@ -494,12 +442,12 @@ modify_dp(struct rte_trie_tbl *dp, struct rte_rib6 *rib,
 	/*
 	 * Check if we can safely allocate new tbl8s further in process of modifying the dataplane.
 	 */
-	uint32_t tbl8s_in_defer_queue = dp->tbl8_pool_pos - dp->cur_tbl8s;
-	if (dp->rsvd_tbl8s + tbl8s_in_defer_queue > dp->number_tbl8s) {
-		rte_rcu_qsbr_dq_reclaim(dp->dq, dp->tbl8_pool_pos - dp->cur_tbl8s,
-			NULL, NULL, NULL);
-		tbl8s_in_defer_queue = dp->tbl8_pool_pos - dp->cur_tbl8s;
-		if (dp->rsvd_tbl8s + tbl8s_in_defer_queue > dp->number_tbl8s)
+	uint32_t tbl8s_in_defer_queue = dp->pool->pool_pos - dp->pool->cur_tbl8s;
+	if (dp->pool->rsvd_tbl8s + tbl8s_in_defer_queue > dp->pool->num_tbl8s) {
+		fib_tbl8_pool_reclaim(dp->pool, tbl8s_in_defer_queue);
+		tbl8s_in_defer_queue = dp->pool->pool_pos - dp->pool->cur_tbl8s;
+		if (dp->pool->rsvd_tbl8s + tbl8s_in_defer_queue >
+				dp->pool->num_tbl8s)
 			return -ENOSPC;
 	}
 
@@ -621,11 +569,12 @@ trie_modify(struct rte_fib6 *fib, const struct rte_ipv6_addr *ip,
 			return -rte_errno;
 
 		new_levels = count_empty_levels(node);
-		if (dp->rsvd_tbl8s + new_levels > dp->number_tbl8s) {
+		if (dp->pool->rsvd_tbl8s + new_levels > dp->pool->num_tbl8s) {
 			rte_rib6_remove(rib, &ip_masked, depth);
 			return -ENOSPC;
 		}
 		dp->rsvd_tbl8s += new_levels;
+		dp->pool->rsvd_tbl8s += new_levels;
 
 		rte_rib6_set_nh(node, next_hop);
 		parent = rte_rib6_lookup_parent(node);
@@ -637,6 +586,7 @@ trie_modify(struct rte_fib6 *fib, const struct rte_ipv6_addr *ip,
 		ret = modify_dp(dp, rib, &ip_masked, depth, next_hop);
 		if (ret != 0) {
 			dp->rsvd_tbl8s -= new_levels;
+			dp->pool->rsvd_tbl8s -= new_levels;
 			rte_rib6_remove(rib, &ip_masked, depth);
 			return ret;
 		}
@@ -659,7 +609,9 @@ successfully_added:
 		if (ret != 0)
 			return ret;
 
-		dp->rsvd_tbl8s -= count_empty_levels(node);
+		new_levels = count_empty_levels(node);
+		dp->rsvd_tbl8s -= new_levels;
+		dp->pool->rsvd_tbl8s -= new_levels;
 		rte_rib6_remove(rib, &ip_masked, depth);
 
 		return 0;
@@ -675,75 +627,109 @@ trie_create(const char *name, int socket_id,
 {
 	char mem_name[TRIE_NAMESIZE];
 	struct rte_trie_tbl *dp = NULL;
+	struct rte_fib_tbl8_pool *pool;
 	uint64_t	def_nh;
-	uint32_t	num_tbl8;
 	enum rte_fib_trie_nh_sz	nh_sz;
 
 	if ((name == NULL) || (conf == NULL) ||
 			(conf->trie.nh_sz < RTE_FIB6_TRIE_2B) ||
 			(conf->trie.nh_sz > RTE_FIB6_TRIE_8B) ||
-			(conf->trie.num_tbl8 >
-			get_max_nh(conf->trie.nh_sz)) ||
-			(conf->trie.num_tbl8 == 0) ||
 			(conf->default_nh >
 			get_max_nh(conf->trie.nh_sz))) {
-
 		rte_errno = EINVAL;
 		return NULL;
 	}
 
 	def_nh = conf->default_nh;
 	nh_sz = conf->trie.nh_sz;
-	num_tbl8 = conf->trie.num_tbl8;
+
+	if (conf->trie.tbl8_pool != NULL) {
+		/* External shared pool: validate nh_sz matches. */
+		pool = conf->trie.tbl8_pool;
+		if (pool->nh_sz != nh_sz) {
+			rte_errno = EINVAL;
+			return NULL;
+		}
+		fib_tbl8_pool_ref(pool);
+	} else {
+		/* Internal pool: create from config. */
+		struct rte_fib_tbl8_pool_conf pool_conf = {
+			.num_tbl8 = conf->trie.num_tbl8,
+			.nh_sz = nh_sz,
+			.socket_id = socket_id,
+		};
+
+		if (conf->trie.num_tbl8 == 0 ||
+		    conf->trie.num_tbl8 >
+		    get_max_nh(nh_sz)) {
+			rte_errno = EINVAL;
+			return NULL;
+		}
+
+		pool = rte_fib_tbl8_pool_create(name, &pool_conf);
+		if (pool == NULL)
+			return NULL;
+	}
 
 	snprintf(mem_name, sizeof(mem_name), "DP_%s", name);
 	dp = rte_zmalloc_socket(name, sizeof(struct rte_trie_tbl) +
 		TRIE_TBL24_NUM_ENT * (1 << nh_sz) + sizeof(uint32_t),
 		RTE_CACHE_LINE_SIZE, socket_id);
 	if (dp == NULL) {
+		fib_tbl8_pool_unref(pool);
 		rte_errno = ENOMEM;
-		return dp;
+		return NULL;
 	}
+
+	dp->def_nh = def_nh;
+	dp->nh_sz = nh_sz;
+	dp->pool = pool;
+	dp->tbl8 = pool->tbl8;
+	dp->consumer.dq = &dp->dq;
+	fib_tbl8_pool_register(pool, &dp->consumer);
 
 	fib_tbl8_write(&dp->tbl24, (def_nh << 1), nh_sz, 1 << 24);
 
-	snprintf(mem_name, sizeof(mem_name), "TBL8_%p", dp);
-	dp->tbl8 = rte_zmalloc_socket(mem_name, FIB_TBL8_GRP_NUM_ENT *
-			(1ll << nh_sz) * (num_tbl8 + 1),
-			RTE_CACHE_LINE_SIZE, socket_id);
-	if (dp->tbl8 == NULL) {
-		rte_errno = ENOMEM;
-		rte_free(dp);
-		return NULL;
-	}
-	dp->def_nh = def_nh;
-	dp->nh_sz = nh_sz;
-	dp->number_tbl8s = num_tbl8;
-
-	snprintf(mem_name, sizeof(mem_name), "TBL8_idxes_%p", dp);
-	dp->tbl8_pool = rte_zmalloc_socket(mem_name,
-			sizeof(uint32_t) * dp->number_tbl8s,
-			RTE_CACHE_LINE_SIZE, socket_id);
-	if (dp->tbl8_pool == NULL) {
-		rte_errno = ENOMEM;
-		rte_free(dp->tbl8);
-		rte_free(dp);
-		return NULL;
-	}
-
-	tbl8_pool_init(dp);
-
 	return dp;
+}
+
+static void
+tbl8_free_subtree(struct rte_trie_tbl *dp, uint64_t tbl8_idx)
+{
+	uint64_t val;
+	uint32_t i;
+
+	for (i = 0; i < FIB_TBL8_GRP_NUM_ENT; i++) {
+		val = get_tbl_val_by_idx(dp->tbl8,
+			tbl8_idx * FIB_TBL8_GRP_NUM_ENT + i, dp->nh_sz);
+		if ((val & TRIE_EXT_ENT) == TRIE_EXT_ENT)
+			tbl8_free_subtree(dp, val >> 1);
+	}
+	dp->pool->cur_tbl8s--;
+	fib_tbl8_pool_cleanup_and_free(dp->pool, tbl8_idx);
 }
 
 void
 trie_free(void *p)
 {
 	struct rte_trie_tbl *dp = (struct rte_trie_tbl *)p;
+	bool shared = dp->pool->refcnt > 1;
+	uint64_t val;
+	uint32_t i;
 
+	fib_tbl8_pool_unregister(dp->pool, &dp->consumer);
+	if (shared && dp->dq != NULL)
+		rte_rcu_qsbr_synchronize(dp->v, RTE_QSBR_THRID_INVALID);
 	rte_rcu_qsbr_dq_delete(dp->dq);
-	rte_free(dp->tbl8_pool);
-	rte_free(dp->tbl8);
+	if (shared) {
+		for (i = 0; i < TRIE_TBL24_NUM_ENT; i++) {
+			val = get_tbl_val_by_idx(dp->tbl24, i, dp->nh_sz);
+			if ((val & TRIE_EXT_ENT) == TRIE_EXT_ENT)
+				tbl8_free_subtree(dp, val >> 1);
+		}
+		dp->pool->rsvd_tbl8s -= dp->rsvd_tbl8s;
+	}
+	fib_tbl8_pool_unref(dp->pool);
 	rte_free(dp);
 }
 
@@ -774,8 +760,8 @@ trie_rcu_qsbr_add(struct rte_trie_tbl *dp, struct rte_fib6_rcu_config *cfg,
 		if (params.max_reclaim_size == 0)
 			params.max_reclaim_size = RTE_FIB6_RCU_DQ_RECLAIM_MAX;
 		params.esize = sizeof(uint64_t);
-		params.free_fn = __rcu_qsbr_free_resource;
-		params.p = dp;
+		params.free_fn = fib_tbl8_pool_rcu_free_cb;
+		params.p = dp->pool;
 		params.v = cfg->v;
 		dp->dq = rte_rcu_qsbr_dq_create(&params);
 		if (dp->dq == NULL) {

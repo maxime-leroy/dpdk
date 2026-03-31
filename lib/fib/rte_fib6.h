@@ -19,6 +19,7 @@
 
 #include <rte_ip6.h>
 #include <rte_rcu_qsbr.h>
+#include <rte_fib_tbl8_pool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -90,6 +91,8 @@ struct rte_fib6_conf {
 		struct {
 			enum rte_fib_trie_nh_sz nh_sz;
 			uint32_t	num_tbl8;
+			/** Shared tbl8 pool (NULL = internal pool) */
+			struct rte_fib_tbl8_pool *tbl8_pool;
 		} trie;
 	};
 };

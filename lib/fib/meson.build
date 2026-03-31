@@ -2,8 +2,9 @@
 # Copyright(c) 2018 Vladimir Medvedkin <medvedkinv@gmail.com>
 # Copyright(c) 2019 Intel Corporation
 
-sources = files('rte_fib.c', 'rte_fib6.c', 'dir24_8.c', 'trie.c')
-headers = files('rte_fib.h', 'rte_fib6.h')
+sources = files('rte_fib.c', 'rte_fib6.c', 'dir24_8.c', 'trie.c',
+	'fib_tbl8_pool.c')
+headers = files('rte_fib.h', 'rte_fib6.h', 'rte_fib_tbl8_pool.h')
 deps += ['rib']
 deps += ['rcu']
 deps += ['net']
