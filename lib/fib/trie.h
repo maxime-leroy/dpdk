@@ -11,6 +11,8 @@
 #include <rte_common.h>
 #include <rte_fib6.h>
 
+#include "fib_tbl8.h"
+
 /**
  * @file
  * RTE IPv6 Longest Prefix Match (LPM)
@@ -18,16 +20,10 @@
 
 /* @internal Total number of tbl24 entries. */
 #define TRIE_TBL24_NUM_ENT	(1 << 24)
-/* @internal Number of entries in a tbl8 group. */
-#define TRIE_TBL8_GRP_NUM_ENT	256ULL
 /* @internal Total number of tbl8 groups in the tbl8. */
 #define TRIE_TBL8_NUM_GROUPS	65536
 /* @internal bitmask with valid and valid_group fields set */
 #define TRIE_EXT_ENT		1
-
-#define BITMAP_SLAB_BIT_SIZE_LOG2	6
-#define BITMAP_SLAB_BIT_SIZE		(1ULL << BITMAP_SLAB_BIT_SIZE_LOG2)
-#define BITMAP_SLAB_BITMASK		(BITMAP_SLAB_BIT_SIZE - 1)
 
 struct rte_trie_tbl {
 	uint32_t	number_tbl8s;	/**< Total number of tbl8s */
@@ -124,7 +120,7 @@ static inline void rte_trie_lookup_bulk_##suffix(void *p,		\
 		j = 3;							\
 		while (is_entry_extended(tmp)) {			\
 			tmp = ((type *)dp->tbl8)[ips[i].a[j++] +	\
-				((tmp >> 1) * TRIE_TBL8_GRP_NUM_ENT)];	\
+				((tmp >> 1) * FIB_TBL8_GRP_NUM_ENT)];	\
 		}							\
 		next_hops[i] = tmp >> 1;				\
 	}								\

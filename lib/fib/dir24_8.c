@@ -17,6 +17,11 @@
 #include "dir24_8.h"
 #include "fib_log.h"
 
+static_assert((int)FIB_NH_SZ_1B == (int)RTE_FIB_DIR24_8_1B, "nh_sz 1B mismatch");
+static_assert((int)FIB_NH_SZ_2B == (int)RTE_FIB_DIR24_8_2B, "nh_sz 2B mismatch");
+static_assert((int)FIB_NH_SZ_4B == (int)RTE_FIB_DIR24_8_4B, "nh_sz 4B mismatch");
+static_assert((int)FIB_NH_SZ_8B == (int)RTE_FIB_DIR24_8_8B, "nh_sz 8B mismatch");
+
 #ifdef CC_AVX512_SUPPORT
 
 #include "dir24_8_avx512.h"
@@ -147,35 +152,6 @@ dir24_8_get_lookup_fn(void *p, enum rte_fib_lookup_type type, bool be_addr)
 	return NULL;
 }
 
-static void
-write_to_fib(void *ptr, uint64_t val, enum rte_fib_dir24_8_nh_sz size, int n)
-{
-	int i;
-	uint8_t *ptr8 = (uint8_t *)ptr;
-	uint16_t *ptr16 = (uint16_t *)ptr;
-	uint32_t *ptr32 = (uint32_t *)ptr;
-	uint64_t *ptr64 = (uint64_t *)ptr;
-
-	switch (size) {
-	case RTE_FIB_DIR24_8_1B:
-		for (i = 0; i < n; i++)
-			ptr8[i] = (uint8_t)val;
-		break;
-	case RTE_FIB_DIR24_8_2B:
-		for (i = 0; i < n; i++)
-			ptr16[i] = (uint16_t)val;
-		break;
-	case RTE_FIB_DIR24_8_4B:
-		for (i = 0; i < n; i++)
-			ptr32[i] = (uint32_t)val;
-		break;
-	case RTE_FIB_DIR24_8_8B:
-		for (i = 0; i < n; i++)
-			ptr64[i] = (uint64_t)val;
-		break;
-	}
-}
-
 /*
  * Get an index of a free tbl8 from the pool
  */
@@ -215,21 +191,21 @@ tbl8_alloc(struct dir24_8_tbl *dp, uint64_t nh)
 	if (tbl8_idx < 0)
 		return tbl8_idx;
 	tbl8_ptr = (uint8_t *)dp->tbl8 +
-		((tbl8_idx * DIR24_8_TBL8_GRP_NUM_ENT) <<
+		((tbl8_idx * FIB_TBL8_GRP_NUM_ENT) <<
 		dp->nh_sz);
 	/*Init tbl8 entries with nexthop from tbl24*/
-	write_to_fib((void *)tbl8_ptr, nh|
+	fib_tbl8_write((void *)tbl8_ptr, nh|
 		DIR24_8_EXT_ENT, dp->nh_sz,
-		DIR24_8_TBL8_GRP_NUM_ENT);
+		FIB_TBL8_GRP_NUM_ENT);
 	return tbl8_idx;
 }
 
 static void
 tbl8_cleanup_and_free(struct dir24_8_tbl *dp, uint64_t tbl8_idx)
 {
-	uint8_t *ptr = (uint8_t *)dp->tbl8 + (tbl8_idx * DIR24_8_TBL8_GRP_NUM_ENT << dp->nh_sz);
+	uint8_t *ptr = (uint8_t *)dp->tbl8 + (tbl8_idx * FIB_TBL8_GRP_NUM_ENT << dp->nh_sz);
 
-	memset(ptr, 0, DIR24_8_TBL8_GRP_NUM_ENT << dp->nh_sz);
+	memset(ptr, 0, FIB_TBL8_GRP_NUM_ENT << dp->nh_sz);
 	tbl8_put(dp, tbl8_idx);
 }
 
@@ -255,9 +231,9 @@ tbl8_recycle(struct dir24_8_tbl *dp, uint32_t ip, uint64_t tbl8_idx)
 	switch (dp->nh_sz) {
 	case RTE_FIB_DIR24_8_1B:
 		ptr8 = &((uint8_t *)dp->tbl8)[tbl8_idx *
-				DIR24_8_TBL8_GRP_NUM_ENT];
+				FIB_TBL8_GRP_NUM_ENT];
 		nh = *ptr8;
-		for (i = 1; i < DIR24_8_TBL8_GRP_NUM_ENT; i++) {
+		for (i = 1; i < FIB_TBL8_GRP_NUM_ENT; i++) {
 			if (nh != ptr8[i])
 				return;
 		}
@@ -266,9 +242,9 @@ tbl8_recycle(struct dir24_8_tbl *dp, uint32_t ip, uint64_t tbl8_idx)
 		break;
 	case RTE_FIB_DIR24_8_2B:
 		ptr16 = &((uint16_t *)dp->tbl8)[tbl8_idx *
-				DIR24_8_TBL8_GRP_NUM_ENT];
+				FIB_TBL8_GRP_NUM_ENT];
 		nh = *ptr16;
-		for (i = 1; i < DIR24_8_TBL8_GRP_NUM_ENT; i++) {
+		for (i = 1; i < FIB_TBL8_GRP_NUM_ENT; i++) {
 			if (nh != ptr16[i])
 				return;
 		}
@@ -277,9 +253,9 @@ tbl8_recycle(struct dir24_8_tbl *dp, uint32_t ip, uint64_t tbl8_idx)
 		break;
 	case RTE_FIB_DIR24_8_4B:
 		ptr32 = &((uint32_t *)dp->tbl8)[tbl8_idx *
-				DIR24_8_TBL8_GRP_NUM_ENT];
+				FIB_TBL8_GRP_NUM_ENT];
 		nh = *ptr32;
-		for (i = 1; i < DIR24_8_TBL8_GRP_NUM_ENT; i++) {
+		for (i = 1; i < FIB_TBL8_GRP_NUM_ENT; i++) {
 			if (nh != ptr32[i])
 				return;
 		}
@@ -288,9 +264,9 @@ tbl8_recycle(struct dir24_8_tbl *dp, uint32_t ip, uint64_t tbl8_idx)
 		break;
 	case RTE_FIB_DIR24_8_8B:
 		ptr64 = &((uint64_t *)dp->tbl8)[tbl8_idx *
-				DIR24_8_TBL8_GRP_NUM_ENT];
+				FIB_TBL8_GRP_NUM_ENT];
 		nh = *ptr64;
-		for (i = 1; i < DIR24_8_TBL8_GRP_NUM_ENT; i++) {
+		for (i = 1; i < FIB_TBL8_GRP_NUM_ENT; i++) {
 			if (nh != ptr64[i])
 				return;
 		}
@@ -343,23 +319,23 @@ install_to_fib(struct dir24_8_tbl *dp, uint32_t ledge, uint32_t redge,
 				}
 				tbl8_put(dp, tmp_tbl8_idx);
 				/*update dir24 entry with tbl8 index*/
-				write_to_fib(get_tbl24_p(dp, ledge,
+				fib_tbl8_write(get_tbl24_p(dp, ledge,
 					dp->nh_sz), (tbl8_idx << 1)|
 					DIR24_8_EXT_ENT,
 					dp->nh_sz, 1);
 			} else
 				tbl8_idx = tbl24_tmp >> 1;
 			tbl8_ptr = (uint8_t *)dp->tbl8 +
-				(((tbl8_idx * DIR24_8_TBL8_GRP_NUM_ENT) +
+				(((tbl8_idx * FIB_TBL8_GRP_NUM_ENT) +
 				(ledge & ~DIR24_8_TBL24_MASK)) <<
 				dp->nh_sz);
 			/*update tbl8 with new next hop*/
-			write_to_fib((void *)tbl8_ptr, (next_hop << 1)|
+			fib_tbl8_write((void *)tbl8_ptr, (next_hop << 1)|
 				DIR24_8_EXT_ENT,
 				dp->nh_sz, ROUNDUP(ledge, 24) - ledge);
 			tbl8_recycle(dp, ledge, tbl8_idx);
 		}
-		write_to_fib(get_tbl24_p(dp, ROUNDUP(ledge, 24), dp->nh_sz),
+		fib_tbl8_write(get_tbl24_p(dp, ROUNDUP(ledge, 24), dp->nh_sz),
 			next_hop << 1, dp->nh_sz, len);
 		if (redge & ~DIR24_8_TBL24_MASK) {
 			tbl24_tmp = get_tbl24(dp, redge, dp->nh_sz);
@@ -369,17 +345,17 @@ install_to_fib(struct dir24_8_tbl *dp, uint32_t ledge, uint32_t redge,
 				if (tbl8_idx < 0)
 					return -ENOSPC;
 				/*update dir24 entry with tbl8 index*/
-				write_to_fib(get_tbl24_p(dp, redge,
+				fib_tbl8_write(get_tbl24_p(dp, redge,
 					dp->nh_sz), (tbl8_idx << 1)|
 					DIR24_8_EXT_ENT,
 					dp->nh_sz, 1);
 			} else
 				tbl8_idx = tbl24_tmp >> 1;
 			tbl8_ptr = (uint8_t *)dp->tbl8 +
-				((tbl8_idx * DIR24_8_TBL8_GRP_NUM_ENT) <<
+				((tbl8_idx * FIB_TBL8_GRP_NUM_ENT) <<
 				dp->nh_sz);
 			/*update tbl8 with new next hop*/
-			write_to_fib((void *)tbl8_ptr, (next_hop << 1)|
+			fib_tbl8_write((void *)tbl8_ptr, (next_hop << 1)|
 				DIR24_8_EXT_ENT,
 				dp->nh_sz, redge & ~DIR24_8_TBL24_MASK);
 			tbl8_recycle(dp, redge, tbl8_idx);
@@ -392,18 +368,18 @@ install_to_fib(struct dir24_8_tbl *dp, uint32_t ledge, uint32_t redge,
 			if (tbl8_idx < 0)
 				return -ENOSPC;
 			/*update dir24 entry with tbl8 index*/
-			write_to_fib(get_tbl24_p(dp, ledge, dp->nh_sz),
+			fib_tbl8_write(get_tbl24_p(dp, ledge, dp->nh_sz),
 				(tbl8_idx << 1)|
 				DIR24_8_EXT_ENT,
 				dp->nh_sz, 1);
 		} else
 			tbl8_idx = tbl24_tmp >> 1;
 		tbl8_ptr = (uint8_t *)dp->tbl8 +
-			(((tbl8_idx * DIR24_8_TBL8_GRP_NUM_ENT) +
+			(((tbl8_idx * FIB_TBL8_GRP_NUM_ENT) +
 			(ledge & ~DIR24_8_TBL24_MASK)) <<
 			dp->nh_sz);
 		/*update tbl8 with new next hop*/
-		write_to_fib((void *)tbl8_ptr, (next_hop << 1)|
+		fib_tbl8_write((void *)tbl8_ptr, (next_hop << 1)|
 			DIR24_8_EXT_ENT,
 			dp->nh_sz, redge - ledge);
 		tbl8_recycle(dp, ledge, tbl8_idx);
@@ -595,7 +571,7 @@ dir24_8_create(const char *name, int socket_id, struct rte_fib_conf *fib_conf)
 	}
 
 	snprintf(mem_name, sizeof(mem_name), "TBL8_%p", dp);
-	tbl8_sz = DIR24_8_TBL8_GRP_NUM_ENT * (1ULL << nh_sz) *
+	tbl8_sz = FIB_TBL8_GRP_NUM_ENT * (1ULL << nh_sz) *
 			(num_tbl8 + 1);
 	dp->tbl8 = rte_zmalloc_socket(mem_name, tbl8_sz,
 			RTE_CACHE_LINE_SIZE, socket_id);
@@ -625,7 +601,7 @@ dir24_8_create(const char *name, int socket_id, struct rte_fib_conf *fib_conf)
 	dp->tbl8_pool_pos = 0;
 
 	/* Init table with default value */
-	write_to_fib(dp->tbl24, (def_nh << 1), nh_sz, 1 << 24);
+	fib_tbl8_write(dp->tbl24, (def_nh << 1), nh_sz, 1 << 24);
 
 	return dp;
 }

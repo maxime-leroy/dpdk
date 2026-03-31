@@ -14,13 +14,14 @@
 #include <rte_branch_prediction.h>
 #include <rte_rcu_qsbr.h>
 
+#include "fib_tbl8.h"
+
 /**
  * @file
  * DIR24_8 algorithm
  */
 
 #define DIR24_8_TBL24_NUM_ENT		(1 << 24)
-#define DIR24_8_TBL8_GRP_NUM_ENT	256U
 #define DIR24_8_EXT_ENT			1
 #define DIR24_8_TBL24_MASK		0xffffff00
 
@@ -68,7 +69,7 @@ get_tbl24_idx(uint32_t ip)
 static  inline uint32_t
 get_tbl8_idx(uint32_t res, uint32_t ip)
 {
-	return (res >> 1) * DIR24_8_TBL8_GRP_NUM_ENT + (uint8_t)ip;
+	return (res >> 1) * FIB_TBL8_GRP_NUM_ENT + (uint8_t)ip;
 }
 
 static inline uint64_t
@@ -129,14 +130,14 @@ static inline void dir24_8_lookup_bulk_##suffix(void *p, const uint32_t *ips, \
 		tmp = ((type *)dp->tbl24)[ips[i] >> 8];			\
 		if (unlikely(is_entry_extended(tmp)))			\
 			tmp = ((type *)dp->tbl8)[(uint8_t)ips[i] +	\
-				((tmp >> 1) * DIR24_8_TBL8_GRP_NUM_ENT)]; \
+				((tmp >> 1) * FIB_TBL8_GRP_NUM_ENT)]; \
 		next_hops[i] = tmp >> 1;				\
 	}								\
 	for (; i < n; i++) {						\
 		tmp = ((type *)dp->tbl24)[ips[i] >> 8];			\
 		if (unlikely(is_entry_extended(tmp)))			\
 			tmp = ((type *)dp->tbl8)[(uint8_t)ips[i] +	\
-				((tmp >> 1) * DIR24_8_TBL8_GRP_NUM_ENT)]; \
+				((tmp >> 1) * FIB_TBL8_GRP_NUM_ENT)]; \
 		next_hops[i] = tmp >> 1;				\
 	}								\
 }									\

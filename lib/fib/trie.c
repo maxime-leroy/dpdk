@@ -17,6 +17,10 @@
 #include "fib_log.h"
 #include "trie.h"
 
+static_assert((int)FIB_NH_SZ_2B == (int)RTE_FIB6_TRIE_2B, "nh_sz 2B mismatch");
+static_assert((int)FIB_NH_SZ_4B == (int)RTE_FIB6_TRIE_4B, "nh_sz 4B mismatch");
+static_assert((int)FIB_NH_SZ_8B == (int)RTE_FIB6_TRIE_8B, "nh_sz 8B mismatch");
+
 #ifdef CC_AVX512_SUPPORT
 
 #include "trie_avx512.h"
@@ -97,30 +101,6 @@ trie_get_lookup_fn(void *p, enum rte_fib6_lookup_type type)
 }
 
 static void
-write_to_dp(void *ptr, uint64_t val, enum rte_fib_trie_nh_sz size, int n)
-{
-	int i;
-	uint16_t *ptr16 = (uint16_t *)ptr;
-	uint32_t *ptr32 = (uint32_t *)ptr;
-	uint64_t *ptr64 = (uint64_t *)ptr;
-
-	switch (size) {
-	case RTE_FIB6_TRIE_2B:
-		for (i = 0; i < n; i++)
-			ptr16[i] = (uint16_t)val;
-		break;
-	case RTE_FIB6_TRIE_4B:
-		for (i = 0; i < n; i++)
-			ptr32[i] = (uint32_t)val;
-		break;
-	case RTE_FIB6_TRIE_8B:
-		for (i = 0; i < n; i++)
-			ptr64[i] = (uint64_t)val;
-		break;
-	}
-}
-
-static void
 tbl8_pool_init(struct rte_trie_tbl *dp)
 {
 	uint32_t i;
@@ -171,10 +151,10 @@ tbl8_alloc(struct rte_trie_tbl *dp, uint64_t nh)
 	if (tbl8_idx < 0)
 		return tbl8_idx;
 	tbl8_ptr = get_tbl_p_by_idx(dp->tbl8,
-		tbl8_idx * TRIE_TBL8_GRP_NUM_ENT, dp->nh_sz);
+		tbl8_idx * FIB_TBL8_GRP_NUM_ENT, dp->nh_sz);
 	/*Init tbl8 entries with nexthop from tbl24*/
-	write_to_dp((void *)tbl8_ptr, nh, dp->nh_sz,
-		TRIE_TBL8_GRP_NUM_ENT);
+	fib_tbl8_write((void *)tbl8_ptr, nh, dp->nh_sz,
+		FIB_TBL8_GRP_NUM_ENT);
 	dp->cur_tbl8s++;
 	return tbl8_idx;
 }
@@ -182,9 +162,9 @@ tbl8_alloc(struct rte_trie_tbl *dp, uint64_t nh)
 static void
 tbl8_cleanup_and_free(struct rte_trie_tbl *dp, uint64_t tbl8_idx)
 {
-	uint8_t *ptr = (uint8_t *)dp->tbl8 + (tbl8_idx * TRIE_TBL8_GRP_NUM_ENT << dp->nh_sz);
+	uint8_t *ptr = (uint8_t *)dp->tbl8 + (tbl8_idx * FIB_TBL8_GRP_NUM_ENT << dp->nh_sz);
 
-	memset(ptr, 0, TRIE_TBL8_GRP_NUM_ENT << dp->nh_sz);
+	memset(ptr, 0, FIB_TBL8_GRP_NUM_ENT << dp->nh_sz);
 	tbl8_put(dp, tbl8_idx);
 }
 
@@ -208,39 +188,39 @@ tbl8_recycle(struct rte_trie_tbl *dp, void *par, uint64_t tbl8_idx)
 	switch (dp->nh_sz) {
 	case RTE_FIB6_TRIE_2B:
 		ptr16 = &((uint16_t *)dp->tbl8)[tbl8_idx *
-				TRIE_TBL8_GRP_NUM_ENT];
+				FIB_TBL8_GRP_NUM_ENT];
 		nh = *ptr16;
 		if (nh & TRIE_EXT_ENT)
 			return;
-		for (i = 1; i < TRIE_TBL8_GRP_NUM_ENT; i++) {
+		for (i = 1; i < FIB_TBL8_GRP_NUM_ENT; i++) {
 			if (nh != ptr16[i])
 				return;
 		}
-		write_to_dp(par, nh, dp->nh_sz, 1);
+		fib_tbl8_write(par, nh, dp->nh_sz, 1);
 		break;
 	case RTE_FIB6_TRIE_4B:
 		ptr32 = &((uint32_t *)dp->tbl8)[tbl8_idx *
-				TRIE_TBL8_GRP_NUM_ENT];
+				FIB_TBL8_GRP_NUM_ENT];
 		nh = *ptr32;
 		if (nh & TRIE_EXT_ENT)
 			return;
-		for (i = 1; i < TRIE_TBL8_GRP_NUM_ENT; i++) {
+		for (i = 1; i < FIB_TBL8_GRP_NUM_ENT; i++) {
 			if (nh != ptr32[i])
 				return;
 		}
-		write_to_dp(par, nh, dp->nh_sz, 1);
+		fib_tbl8_write(par, nh, dp->nh_sz, 1);
 		break;
 	case RTE_FIB6_TRIE_8B:
 		ptr64 = &((uint64_t *)dp->tbl8)[tbl8_idx *
-				TRIE_TBL8_GRP_NUM_ENT];
+				FIB_TBL8_GRP_NUM_ENT];
 		nh = *ptr64;
 		if (nh & TRIE_EXT_ENT)
 			return;
-		for (i = 1; i < TRIE_TBL8_GRP_NUM_ENT; i++) {
+		for (i = 1; i < FIB_TBL8_GRP_NUM_ENT; i++) {
 			if (nh != ptr64[i])
 				return;
 		}
-		write_to_dp(par, nh, dp->nh_sz, 1);
+		fib_tbl8_write(par, nh, dp->nh_sz, 1);
 		break;
 	}
 
@@ -268,7 +248,7 @@ get_idx(const struct rte_ipv6_addr *ip, uint64_t prev_idx, int bytes, int first_
 		bitshift = (int8_t)(((first_byte + bytes - 1) - i)*BYTE_SIZE);
 		idx |= ip->a[i] <<  bitshift;
 	}
-	return (prev_idx * TRIE_TBL8_GRP_NUM_ENT) + idx;
+	return (prev_idx * FIB_TBL8_GRP_NUM_ENT) + idx;
 }
 
 static inline uint64_t
@@ -306,7 +286,7 @@ recycle_root_path(struct rte_trie_tbl *dp, const uint8_t *ip_part,
 
 	if (common_tbl8 != 0) {
 		p = get_tbl_p_by_idx(dp->tbl8, (val >> 1) *
-			TRIE_TBL8_GRP_NUM_ENT + *ip_part, dp->nh_sz);
+			FIB_TBL8_GRP_NUM_ENT + *ip_part, dp->nh_sz);
 		recycle_root_path(dp, ip_part + 1, common_tbl8 - 1, p);
 	}
 	tbl8_recycle(dp, prev, val >> 1);
@@ -331,7 +311,7 @@ build_common_root(struct rte_trie_tbl *dp, const struct rte_ipv6_addr *ip,
 			tbl8_idx = tbl8_alloc(dp, val);
 			if (unlikely(tbl8_idx < 0))
 				return tbl8_idx;
-			write_to_dp(tbl_ptr, ((uint64_t)tbl8_idx << 1) |
+			fib_tbl8_write(tbl_ptr, ((uint64_t)tbl8_idx << 1) |
 				TRIE_EXT_ENT, dp->nh_sz, 1);
 			prev_idx = (uint64_t)tbl8_idx;
 		} else
@@ -340,7 +320,7 @@ build_common_root(struct rte_trie_tbl *dp, const struct rte_ipv6_addr *ip,
 		j = i;
 		cur_tbl = dp->tbl8;
 	}
-	*tbl = get_tbl_p_by_idx(cur_tbl, prev_idx * TRIE_TBL8_GRP_NUM_ENT,
+	*tbl = get_tbl_p_by_idx(cur_tbl, prev_idx * FIB_TBL8_GRP_NUM_ENT,
 		dp->nh_sz);
 	return 0;
 }
@@ -365,22 +345,22 @@ write_edge(struct rte_trie_tbl *dp, const uint8_t *ip_part, uint64_t next_hop,
 			val = ((uint64_t)tbl8_idx << 1) | TRIE_EXT_ENT;
 		}
 		p = get_tbl_p_by_idx(dp->tbl8, (tbl8_idx *
-			TRIE_TBL8_GRP_NUM_ENT) + *ip_part, dp->nh_sz);
+			FIB_TBL8_GRP_NUM_ENT) + *ip_part, dp->nh_sz);
 		ret = write_edge(dp, ip_part + 1, next_hop, len - 1, edge, p);
 		if (ret < 0)
 			return ret;
 		if (edge == LEDGE) {
-			write_to_dp(RTE_PTR_ADD(p, (uintptr_t)(1) << dp->nh_sz),
+			fib_tbl8_write(RTE_PTR_ADD(p, (uintptr_t)(1) << dp->nh_sz),
 				next_hop << 1, dp->nh_sz, UINT8_MAX - *ip_part);
 		} else {
-			write_to_dp(get_tbl_p_by_idx(dp->tbl8, tbl8_idx *
-				TRIE_TBL8_GRP_NUM_ENT, dp->nh_sz),
+			fib_tbl8_write(get_tbl_p_by_idx(dp->tbl8, tbl8_idx *
+				FIB_TBL8_GRP_NUM_ENT, dp->nh_sz),
 				next_hop << 1, dp->nh_sz, *ip_part);
 		}
 		tbl8_recycle(dp, &val, tbl8_idx);
 	}
 
-	write_to_dp(ent, val, dp->nh_sz, 1);
+	fib_tbl8_write(ent, val, dp->nh_sz, 1);
 	return ret;
 }
 
@@ -461,7 +441,7 @@ install_to_dp(struct rte_trie_tbl *dp, const struct rte_ipv6_addr *ledge,
 	if (right_idx > left_idx + 1) {
 		ent = get_tbl_p_by_idx(common_root_tbl, left_idx + 1,
 			dp->nh_sz);
-		write_to_dp(ent, next_hop << 1, dp->nh_sz,
+		fib_tbl8_write(ent, next_hop << 1, dp->nh_sz,
 			right_idx - (left_idx + 1));
 	}
 	ent = get_tbl_p_by_idx(common_root_tbl, right_idx, dp->nh_sz);
@@ -725,10 +705,10 @@ trie_create(const char *name, int socket_id,
 		return dp;
 	}
 
-	write_to_dp(&dp->tbl24, (def_nh << 1), nh_sz, 1 << 24);
+	fib_tbl8_write(&dp->tbl24, (def_nh << 1), nh_sz, 1 << 24);
 
 	snprintf(mem_name, sizeof(mem_name), "TBL8_%p", dp);
-	dp->tbl8 = rte_zmalloc_socket(mem_name, TRIE_TBL8_GRP_NUM_ENT *
+	dp->tbl8 = rte_zmalloc_socket(mem_name, FIB_TBL8_GRP_NUM_ENT *
 			(1ll << nh_sz) * (num_tbl8 + 1),
 			RTE_CACHE_LINE_SIZE, socket_id);
 	if (dp->tbl8 == NULL) {
