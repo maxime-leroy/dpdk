@@ -68,7 +68,7 @@ static int
 test_fib6_perf(void)
 {
 	struct rte_fib6 *fib = NULL;
-	struct rte_fib6_conf conf;
+	struct rte_fib6_conf conf = { 0 };
 	uint64_t begin, total_time;
 	unsigned int i, j;
 	uint64_t next_hop_add;
