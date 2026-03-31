@@ -103,25 +103,7 @@ trie_get_lookup_fn(void *p, enum rte_fib6_lookup_type type)
 static int
 tbl8_alloc(struct rte_trie_tbl *dp, uint64_t nh)
 {
-	int64_t		tbl8_idx;
-	uint8_t		*tbl8_ptr;
-
-	tbl8_idx = fib_tbl8_pool_get(dp->pool);
-
-	/* If there are no tbl8 groups try to reclaim one. */
-	if (unlikely(tbl8_idx == -ENOSPC &&
-			fib_tbl8_pool_reclaim(dp->pool, 1) != 0))
-		tbl8_idx = fib_tbl8_pool_get(dp->pool);
-
-	if (tbl8_idx < 0)
-		return tbl8_idx;
-	tbl8_ptr = get_tbl_p_by_idx(dp->tbl8,
-		tbl8_idx * FIB_TBL8_GRP_NUM_ENT, dp->nh_sz);
-	/*Init tbl8 entries with nexthop from tbl24*/
-	fib_tbl8_write((void *)tbl8_ptr, nh, dp->nh_sz,
-		FIB_TBL8_GRP_NUM_ENT);
-	dp->pool->cur_tbl8s++;
-	return tbl8_idx;
+	return fib_tbl8_pool_alloc(dp->pool, nh);
 }
 
 static void
@@ -442,13 +424,11 @@ modify_dp(struct rte_trie_tbl *dp, struct rte_rib6 *rib,
 	/*
 	 * Check if we can safely allocate new tbl8s further in process of modifying the dataplane.
 	 */
-	uint32_t tbl8s_in_defer_queue = dp->pool->pool_pos - dp->pool->cur_tbl8s;
-	if (dp->pool->rsvd_tbl8s + tbl8s_in_defer_queue > dp->pool->num_tbl8s) {
-		fib_tbl8_pool_reclaim(dp->pool, tbl8s_in_defer_queue);
-		tbl8s_in_defer_queue = dp->pool->pool_pos - dp->pool->cur_tbl8s;
-		if (dp->pool->rsvd_tbl8s + tbl8s_in_defer_queue >
-				dp->pool->num_tbl8s)
-			return -ENOSPC;
+	if (dp->pool->rsvd_tbl8s > dp->pool->cur_tbl8s) {
+		ret = fib_tbl8_pool_reserve(dp->pool,
+			dp->pool->rsvd_tbl8s - dp->pool->cur_tbl8s);
+		if (ret != 0)
+			return ret;
 	}
 
 	ledge = *ip;
@@ -569,7 +549,9 @@ trie_modify(struct rte_fib6 *fib, const struct rte_ipv6_addr *ip,
 			return -rte_errno;
 
 		new_levels = count_empty_levels(node);
-		if (dp->pool->rsvd_tbl8s + new_levels > dp->pool->num_tbl8s) {
+		if (dp->pool->rsvd_tbl8s + new_levels >
+				(dp->pool->max_tbl8s ? dp->pool->max_tbl8s :
+					dp->pool->num_tbl8s)) {
 			rte_rib6_remove(rib, &ip_masked, depth);
 			return -ENOSPC;
 		}
@@ -685,6 +667,8 @@ trie_create(const char *name, int socket_id,
 	dp->nh_sz = nh_sz;
 	dp->pool = pool;
 	dp->tbl8 = pool->tbl8;
+
+	dp->consumer.tbl8_ptr = &dp->tbl8;
 	dp->consumer.dq = &dp->dq;
 	fib_tbl8_pool_register(pool, &dp->consumer);
 
@@ -739,12 +723,29 @@ trie_rcu_qsbr_add(struct rte_trie_tbl *dp, struct rte_fib6_rcu_config *cfg,
 {
 	struct rte_rcu_qsbr_dq_parameters params = {0};
 	char rcu_dq_name[RTE_RCU_QSBR_DQ_NAMESIZE];
+	bool pool_rcu_added = false;
 
 	if (dp == NULL || cfg == NULL)
 		return -EINVAL;
 
 	if (dp->v != NULL)
 		return -EEXIST;
+
+	/* Propagate RCU to the pool for resize if it is resizable */
+	if (dp->pool->max_tbl8s > 0) {
+		if (dp->pool->v != NULL && dp->pool->v != cfg->v)
+			return -EINVAL;
+		if (dp->pool->v == NULL) {
+			struct rte_fib_tbl8_pool_rcu_config pool_rcu = {
+				.v = cfg->v,
+			};
+			int rc = rte_fib_tbl8_pool_rcu_qsbr_add(
+				dp->pool, &pool_rcu);
+			if (rc != 0)
+				return rc;
+			pool_rcu_added = true;
+		}
+	}
 
 	switch (cfg->mode) {
 	case RTE_FIB6_QSBR_MODE_DQ:
@@ -766,6 +767,8 @@ trie_rcu_qsbr_add(struct rte_trie_tbl *dp, struct rte_fib6_rcu_config *cfg,
 		dp->dq = rte_rcu_qsbr_dq_create(&params);
 		if (dp->dq == NULL) {
 			FIB_LOG(ERR, "FIB6 defer queue creation failed");
+			if (pool_rcu_added)
+				dp->pool->v = NULL;
 			return -ENOMEM;
 		}
 		break;
@@ -773,6 +776,8 @@ trie_rcu_qsbr_add(struct rte_trie_tbl *dp, struct rte_fib6_rcu_config *cfg,
 		/* No other things to do. */
 		break;
 	default:
+		if (pool_rcu_added)
+			dp->pool->v = NULL;
 		return -EINVAL;
 	}
 	dp->rcu_mode = cfg->mode;

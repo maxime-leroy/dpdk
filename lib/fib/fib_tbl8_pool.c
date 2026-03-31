@@ -6,11 +6,14 @@
 #include <string.h>
 
 #include <eal_export.h>
+#include <rte_branch_prediction.h>
 #include <rte_debug.h>
 #include <rte_errno.h>
 #include <rte_malloc.h>
 #include <rte_rcu_qsbr.h>
+#include <rte_stdatomic.h>
 
+#include "fib_log.h"
 #include "fib_tbl8_pool.h"
 
 static inline uint64_t
@@ -69,6 +72,91 @@ fib_tbl8_pool_rcu_free_cb(void *p, void *data,
 	fib_tbl8_pool_cleanup_and_free(pool, tbl8_idx);
 }
 
+RTE_EXPORT_EXPERIMENTAL_SYMBOL(rte_fib_tbl8_pool_resize, 27.03)
+int
+rte_fib_tbl8_pool_resize(struct rte_fib_tbl8_pool *pool,
+			 uint32_t new_num_tbl8)
+{
+	uint32_t new_num, old_num, i;
+	uint64_t *new_tbl8, *old_tbl8;
+	uint32_t *new_fl, *old_fl;
+	char mem_name[64];
+	struct fib_tbl8_consumer *c;
+
+	if (pool == NULL)
+		return -EINVAL;
+	if (pool->v == NULL)
+		return -EINVAL;
+
+	old_num = pool->num_tbl8s;
+	new_num = new_num_tbl8;
+	if (pool->max_tbl8s != 0 && new_num > pool->max_tbl8s)
+		new_num = pool->max_tbl8s;
+	if (new_num <= old_num)
+		return -ENOSPC;
+
+	FIB_LOG(INFO, "Resizing tbl8 pool from %u to %u groups",
+		old_num, new_num);
+
+	snprintf(mem_name, sizeof(mem_name), "TBL8_%u", new_num);
+	new_tbl8 = rte_zmalloc_socket(mem_name,
+		FIB_TBL8_GRP_NUM_ENT * (1ULL << pool->nh_sz) * (new_num + 1),
+		RTE_CACHE_LINE_SIZE, pool->socket_id);
+	if (new_tbl8 == NULL)
+		return -ENOMEM;
+
+	snprintf(mem_name, sizeof(mem_name), "TBL8_FL_%u", new_num);
+	new_fl = rte_zmalloc_socket(mem_name,
+		sizeof(uint32_t) * new_num,
+		RTE_CACHE_LINE_SIZE, pool->socket_id);
+	if (new_fl == NULL) {
+		rte_free(new_tbl8);
+		return -ENOMEM;
+	}
+
+	/* Copy existing tbl8 data */
+	memcpy(new_tbl8, pool->tbl8,
+		FIB_TBL8_GRP_NUM_ENT * (1ULL << pool->nh_sz) * (old_num + 1));
+
+	/*
+	 * Rebuild the free list: copy the existing in-use portion,
+	 * then append new indices at the top.
+	 */
+	memcpy(new_fl, pool->free_list, sizeof(uint32_t) * old_num);
+	for (i = old_num; i < new_num; i++)
+		new_fl[i] = i;
+
+	old_tbl8 = pool->tbl8;
+	old_fl = pool->free_list;
+
+	pool->free_list = new_fl;
+	pool->num_tbl8s = new_num;
+
+	/*
+	 * Ensure copied tbl8 contents are visible before publishing
+	 * the new pointer on weakly ordered architectures.
+	 */
+	rte_atomic_thread_fence(rte_memory_order_release);
+
+	pool->tbl8 = new_tbl8;
+
+	/* Update all registered consumer tbl8 pointers */
+	SLIST_FOREACH(c, &pool->consumers, next)
+		*c->tbl8_ptr = new_tbl8;
+
+	/*
+	 * If RCU is configured, readers may still be accessing old_tbl8.
+	 * Synchronize before freeing.
+	 */
+	if (pool->v != NULL)
+		rte_rcu_qsbr_synchronize(pool->v, RTE_QSBR_THRID_INVALID);
+
+	rte_free(old_tbl8);
+	rte_free(old_fl);
+
+	return 0;
+}
+
 uint32_t
 fib_tbl8_pool_reclaim(struct rte_fib_tbl8_pool *pool, uint32_t n)
 {
@@ -87,6 +175,52 @@ fib_tbl8_pool_reclaim(struct rte_fib_tbl8_pool *pool, uint32_t n)
 	}
 
 	return total;
+}
+
+int
+fib_tbl8_pool_reserve(struct rte_fib_tbl8_pool *pool, uint32_t n)
+{
+	uint32_t avail = pool->num_tbl8s - pool->pool_pos;
+
+	if (avail >= n)
+		return 0;
+
+	fib_tbl8_pool_reclaim(pool, n - avail);
+	avail = pool->num_tbl8s - pool->pool_pos;
+
+	while (avail < n) {
+		if (pool->max_tbl8s == 0 ||
+				rte_fib_tbl8_pool_resize(pool, pool->num_tbl8s * 2) != 0)
+			return -ENOSPC;
+		avail = pool->num_tbl8s - pool->pool_pos;
+	}
+
+	return 0;
+}
+
+int
+fib_tbl8_pool_alloc(struct rte_fib_tbl8_pool *pool, uint64_t nh)
+{
+	int32_t tbl8_idx;
+	uint8_t *tbl8_ptr;
+
+	tbl8_idx = fib_tbl8_pool_get(pool);
+
+	/* If there are no tbl8 groups try to reclaim one. */
+	if (unlikely(tbl8_idx == -ENOSPC &&
+			fib_tbl8_pool_reclaim(pool, 1) != 0))
+		tbl8_idx = fib_tbl8_pool_get(pool);
+
+	if (tbl8_idx < 0)
+		return tbl8_idx;
+
+	tbl8_ptr = (uint8_t *)pool->tbl8 +
+		((tbl8_idx * FIB_TBL8_GRP_NUM_ENT) << pool->nh_sz);
+	/* Init tbl8 entries with nexthop */
+	fib_tbl8_write((void *)tbl8_ptr, nh, pool->nh_sz,
+		       FIB_TBL8_GRP_NUM_ENT);
+	pool->cur_tbl8s++;
+	return tbl8_idx;
 }
 
 void
@@ -135,7 +269,10 @@ rte_fib_tbl8_pool_create(const char *name,
 
 	if (name == NULL || conf == NULL || conf->num_tbl8 == 0 ||
 	    conf->nh_sz > 3 ||
-	    conf->num_tbl8 > pool_max_tbl8(conf->nh_sz)) {
+	    conf->num_tbl8 > pool_max_tbl8(conf->nh_sz) ||
+	    conf->max_tbl8 > pool_max_tbl8(conf->nh_sz) ||
+	    (conf->max_tbl8 != 0 &&
+	     conf->max_tbl8 < conf->num_tbl8)) {
 		rte_errno = EINVAL;
 		return NULL;
 	}
@@ -150,8 +287,10 @@ rte_fib_tbl8_pool_create(const char *name,
 
 	pool->nh_sz = conf->nh_sz;
 	pool->num_tbl8s = conf->num_tbl8;
+	pool->max_tbl8s = conf->max_tbl8;
 	pool->socket_id = conf->socket_id;
 	pool->refcnt = 1;
+	SLIST_INIT(&pool->consumers);
 
 	snprintf(mem_name, sizeof(mem_name), "TBL8_%s", name);
 	pool->tbl8 = rte_zmalloc_socket(mem_name,
@@ -176,7 +315,6 @@ rte_fib_tbl8_pool_create(const char *name,
 	}
 
 	pool_init_free_list(pool);
-	SLIST_INIT(&pool->consumers);
 
 	return pool;
 }
@@ -189,4 +327,22 @@ rte_fib_tbl8_pool_free(struct rte_fib_tbl8_pool *pool)
 		return;
 
 	fib_tbl8_pool_unref(pool);
+}
+
+RTE_EXPORT_EXPERIMENTAL_SYMBOL(rte_fib_tbl8_pool_rcu_qsbr_add, 27.03)
+int
+rte_fib_tbl8_pool_rcu_qsbr_add(struct rte_fib_tbl8_pool *pool,
+			       const struct rte_fib_tbl8_pool_rcu_config *cfg)
+{
+	if (pool == NULL || cfg == NULL || cfg->v == NULL)
+		return -EINVAL;
+
+	if (pool->v != NULL)
+		return -EEXIST;
+
+	if (pool->max_tbl8s == 0)
+		return -ENOTSUP;
+
+	pool->v = cfg->v;
+	return 0;
 }

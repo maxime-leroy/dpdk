@@ -21,6 +21,12 @@
  *    rte_fib_tbl8_pool_free(). The pool is freed when the last
  *    reference is dropped.
  *
+ * Resizing: if max_tbl8 is set in the pool configuration, the pool
+ * can grow on demand up to that limit. This requires an RCU QSBR
+ * variable (rte_fib_tbl8_pool_rcu_qsbr_add). When max_tbl8 is 0
+ * (default), the pool has a fixed capacity and no RCU is needed
+ * for pool operation.
+ *
  * Thread safety: none. The pool is not thread-safe. All operations
  * on FIBs sharing the same pool (route updates, FIB creation and
  * destruction, pool create/free) must be serialized by the caller.
@@ -36,6 +42,8 @@
 
 #include <stdint.h>
 
+#include <rte_rcu_qsbr.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -44,9 +52,15 @@ struct rte_fib_tbl8_pool;
 
 /** tbl8 pool configuration */
 struct rte_fib_tbl8_pool_conf {
-	uint32_t num_tbl8;	/**< Number of tbl8 groups */
+	uint32_t num_tbl8;	/**< Initial number of tbl8 groups */
+	uint32_t max_tbl8;	/**< Max tbl8 groups (0 = fixed, no resize) */
 	uint8_t  nh_sz;		/**< Nexthop size: 0=1B, 1=2B, 2=4B, 3=8B */
 	int      socket_id;	/**< NUMA socket for memory allocation */
+};
+
+/** RCU QSBR configuration for tbl8 pool resize. */
+struct rte_fib_tbl8_pool_rcu_config {
+	struct rte_rcu_qsbr *v;	/**< RCU QSBR variable */
 };
 
 /**
@@ -76,6 +90,46 @@ rte_fib_tbl8_pool_create(const char *name,
 __rte_experimental
 void
 rte_fib_tbl8_pool_free(struct rte_fib_tbl8_pool *pool);
+
+/**
+ * Associate an RCU QSBR variable with the pool.
+ *
+ * Required for resizable pools so that the old tbl8 array can be
+ * reclaimed safely after a resize.
+ *
+ * @param pool
+ *   Pool handle
+ * @param cfg
+ *   RCU configuration
+ * @return
+ *   0 on success, negative errno on failure
+ */
+__rte_experimental
+int
+rte_fib_tbl8_pool_rcu_qsbr_add(struct rte_fib_tbl8_pool *pool,
+			       const struct rte_fib_tbl8_pool_rcu_config *cfg);
+
+/**
+ * Resize the tbl8 pool to a given capacity.
+ *
+ * The new capacity must be greater than the current capacity and
+ * must not exceed max_tbl8 (if set). Requires RCU to be configured.
+ *
+ * @param pool
+ *   Pool handle
+ * @param new_num_tbl8
+ *   Target number of tbl8 groups
+ * @return
+ *   0 on success
+ *   -EINVAL if RCU is not configured (see rte_fib_tbl8_pool_rcu_qsbr_add)
+ *   -ENOSPC if pool cannot grow (at max capacity or
+ *     new_num_tbl8 <= current capacity)
+ *   -ENOMEM if memory allocation failed
+ */
+__rte_experimental
+int
+rte_fib_tbl8_pool_resize(struct rte_fib_tbl8_pool *pool,
+			 uint32_t new_num_tbl8);
 
 #ifdef __cplusplus
 }
