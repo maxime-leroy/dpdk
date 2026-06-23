@@ -22,6 +22,7 @@
 #include <dpaa2_hw_pvt.h>
 #include <dpaa2_hw_dpio.h>
 #include <dpaa2_hw_mempool.h>
+#include <fsl_qbman_debug.h>
 
 #include "dpaa2_pmd_logs.h"
 #include "dpaa2_ethdev.h"
@@ -1177,7 +1178,13 @@ dpaa2_dev_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 uint16_t __rte_hot
 dpaa2_dev_rx_channel(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 {
-	return dpaa2_dev_rx_common(queue, bufs, nb_pkts, true);
+	struct dpaa2_queue *dpaa2_q = queue;
+	uint16_t n;
+
+	dpaa2_q->napi_poll_count++;
+	n = dpaa2_dev_rx_common(queue, bufs, nb_pkts, true);
+	dpaa2_q->napi_deq_count += n;
+	return n;
 }
 
 uint16_t dpaa2_dev_tx_conf(void *queue)

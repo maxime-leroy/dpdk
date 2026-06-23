@@ -402,6 +402,7 @@ void qbman_swp_interrupt_set_vanish(struct qbman_swp *p, uint32_t mask)
 	qbman_cinh_write(&p->sys, QBMAN_CINH_SWP_ISDR, mask);
 }
 
+RTE_EXPORT_INTERNAL_SYMBOL(qbman_swp_interrupt_read_status)
 uint32_t qbman_swp_interrupt_read_status(struct qbman_swp *p)
 {
 	return qbman_cinh_read(&p->sys, QBMAN_CINH_SWP_ISR);
@@ -433,6 +434,7 @@ void qbman_swp_intr_timeout_write(struct qbman_swp *p, uint32_t mask)
 	qbman_cinh_write(&p->sys, QBMAN_CINH_SWP_ITPR, mask);
 }
 
+RTE_EXPORT_INTERNAL_SYMBOL(qbman_swp_interrupt_get_trigger)
 uint32_t qbman_swp_interrupt_get_trigger(struct qbman_swp *p)
 {
 	return qbman_cinh_read(&p->sys, QBMAN_CINH_SWP_IER);
@@ -443,6 +445,7 @@ void qbman_swp_interrupt_set_trigger(struct qbman_swp *p, uint32_t mask)
 	qbman_cinh_write(&p->sys, QBMAN_CINH_SWP_IER, mask);
 }
 
+RTE_EXPORT_INTERNAL_SYMBOL(qbman_swp_interrupt_get_inhibit)
 int qbman_swp_interrupt_get_inhibit(struct qbman_swp *p)
 {
 	return qbman_cinh_read(&p->sys, QBMAN_CINH_SWP_IIR);
@@ -2337,6 +2340,7 @@ int qbman_result_is_FQDAN(const struct qbman_result *dq)
 	return __qbman_result_is_x(dq, QBMAN_RESULT_FQDAN);
 }
 
+RTE_EXPORT_INTERNAL_SYMBOL(qbman_result_is_CDAN)
 int qbman_result_is_CDAN(const struct qbman_result *dq)
 {
 	return __qbman_result_is_x(dq, QBMAN_RESULT_CDAN);
@@ -2438,6 +2442,7 @@ uint32_t qbman_result_SCN_rid(const struct qbman_result *scn)
 	return scn->scn.rid_tok;
 }
 
+RTE_EXPORT_INTERNAL_SYMBOL(qbman_result_SCN_ctx)
 uint64_t qbman_result_SCN_ctx(const struct qbman_result *scn)
 {
 	return scn->scn.ctx;

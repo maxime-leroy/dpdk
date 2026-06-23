@@ -203,6 +203,7 @@ struct qbman_fq_query_desc {
 };
 
 /* FQ query function for programmable fields */
+RTE_EXPORT_INTERNAL_SYMBOL(qbman_fq_query)
 int qbman_fq_query(struct qbman_swp *s, uint32_t fqid,
 		   struct qbman_fq_query_rslt *r)
 {
@@ -247,6 +248,7 @@ uint16_t qbman_fq_attr_get_cgrid(struct qbman_fq_query_rslt *r)
 	return r->cgid;
 }
 
+RTE_EXPORT_INTERNAL_SYMBOL(qbman_fq_attr_get_destwq)
 uint16_t qbman_fq_attr_get_destwq(struct qbman_fq_query_rslt *r)
 {
 	return r->dest_wq;
@@ -360,26 +362,31 @@ int qbman_fq_query_state(struct qbman_swp *s, uint32_t fqid,
 	return 0;
 }
 
+RTE_EXPORT_INTERNAL_SYMBOL(qbman_fq_state_schedstate)
 uint8_t qbman_fq_state_schedstate(const struct qbman_fq_query_np_rslt *r)
 {
 	return r->st1 & 0x7;
 }
 
+RTE_EXPORT_INTERNAL_SYMBOL(qbman_fq_state_force_eligible)
 int qbman_fq_state_force_eligible(const struct qbman_fq_query_np_rslt *r)
 {
 	return (int)((r->st1 & 0x8) >> 3);
 }
 
+RTE_EXPORT_INTERNAL_SYMBOL(qbman_fq_state_xoff)
 int qbman_fq_state_xoff(const struct qbman_fq_query_np_rslt *r)
 {
 	return (int)((r->st1 & 0x10) >> 4);
 }
 
+RTE_EXPORT_INTERNAL_SYMBOL(qbman_fq_state_retirement_pending)
 int qbman_fq_state_retirement_pending(const struct qbman_fq_query_np_rslt *r)
 {
 	return (int)((r->st1 & 0x20) >> 5);
 }
 
+RTE_EXPORT_INTERNAL_SYMBOL(qbman_fq_state_overflow_error)
 int qbman_fq_state_overflow_error(const struct qbman_fq_query_np_rslt *r)
 {
 	return (int)((r->st1 & 0x40) >> 6);
@@ -391,6 +398,7 @@ uint32_t qbman_fq_state_frame_count(const struct qbman_fq_query_np_rslt *r)
 	return (r->frm_cnt & 0x00FFFFFF);
 }
 
+RTE_EXPORT_INTERNAL_SYMBOL(qbman_fq_state_byte_count)
 uint32_t qbman_fq_state_byte_count(const struct qbman_fq_query_np_rslt *r)
 {
 	return r->byte_cnt;

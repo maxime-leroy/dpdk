@@ -2104,6 +2104,50 @@ out:
 	priv->cnt_values_dma_mem = NULL;
 }
 
+/* debug: per-queue QBMan FQ state appended after the dpni/mac xstats.
+ * frame_count is accumulated across reads (counter semantics), schedstate
+ * and xoff are instantaneous. accumulators are zeroed on stats_reset.
+ */
+#define DPAA2_RXQ_DBG_STATS 22	/* frame_count, schedstate, xoff, napi_sub_dpio,
+				 * napi_armed, napi_dpcon_id, napi_cdan_count,
+				 * fq_destwq, force_eligible, retirement_pending,
+				 * overflow_error, byte_count, napi_poll_count,
+				 * napi_deq_count, napi_isr, napi_ier, napi_iir,
+				 * napi_refcnt, napi_intr_enable_cnt,
+				 * napi_intr_disable_cnt, napi_arm_fqne,
+				 * napi_cdan_enable_cnt
+				 */
+#define DPAA2_TXQ_DBG_STATS 2	/* ceetm dequeue/reject frames (TX = CEETM, not a QMan FQ) */
+static uint64_t dpaa2_qbman_rx_frm_accum[RTE_MAX_ETHPORTS][MAX_RX_QUEUES];
+/* CEETM page-3 counters are monotonic and (maybe) not cleared by
+ * dpni_reset_statistics; snapshot a baseline on reset and report the delta.
+ */
+static uint64_t dpaa2_ceetm_deq_base[RTE_MAX_ETHPORTS][MAX_TX_QUEUES];
+static uint64_t dpaa2_ceetm_rej_base[RTE_MAX_ETHPORTS][MAX_TX_QUEUES];
+
+/* CEETM Tx stats live in dpni_get_statistics page 3, indexed by a
+ * (channel << 8) | tc parameter. counter[1]=dequeue_frames, [3]=reject_frames.
+ */
+static void
+dpaa2_ceetm_tx_query(struct fsl_mc_io *dpni, struct dpaa2_dev_priv *priv,
+		     unsigned int q, uint64_t *deq, uint64_t *rej)
+{
+	union dpni_statistics value = {};
+	uint16_t param;
+
+	*deq = 0;
+	*rej = 0;
+	if (!priv->num_tx_tc || !priv->num_channels)
+		return;
+	param = (((q / priv->num_tx_tc) % priv->num_channels) << 8) |
+		(q % priv->num_tx_tc);
+	if (dpni_get_statistics(dpni, CMD_PRI_LOW, priv->token, 3, param,
+				&value) == 0) {
+		*deq = value.raw.counter[1];
+		*rej = value.raw.counter[3];
+	}
+}
+
 /*
  * dpaa2_dev_xstats_get(): Get counters of dpni and dpmac.
  * MAC (mac_*) counters are supported on MC version > 10.39.0
@@ -2122,9 +2166,16 @@ dpaa2_dev_xstats_get(struct rte_eth_dev *dev,
 	uint64_t *cnt_values;
 	int32_t retcode;
 	int16_t tc;
+	unsigned int total = num +
+		dev->data->nb_rx_queues * DPAA2_RXQ_DBG_STATS +
+		dev->data->nb_tx_queues * DPAA2_TXQ_DBG_STATS;
+	struct qbman_fq_query_np_rslt fqstate;
+	struct qbman_fq_query_rslt fqattr;
+	uint16_t pid = dev->data->port_id;
+	struct qbman_swp *swp = NULL;
 
-	if (n < num)
-		return num;
+	if (n < total)
+		return total;
 
 	if (!xstats)
 		return 0;
@@ -2198,13 +2249,104 @@ dpaa2_dev_xstats_get(struct rte_eth_dev *dev,
 			xstats[i].value = rte_le_to_cpu_64(*cnt_values++);
 			i++;
 		}
-		return i;
+	} else {
+		while (i >= (num - DPAA2_MAC_NUM_STATS) && i < num) {
+			xstats[i].id = i;
+			xstats[i].value = 0;
+			i++;
+		}
 	}
 
-	while (i >= (num - DPAA2_MAC_NUM_STATS) && i < num) {
+	/* per-queue QBMan FQ state (debug instrumentation) */
+	if (DPAA2_PER_LCORE_DPIO || dpaa2_affine_qbman_swp() == 0)
+		swp = DPAA2_PER_LCORE_PORTAL;
+	for (j = 0; j < dev->data->nb_rx_queues; j++) {
+		struct dpaa2_queue *dq = priv->rx_vq[j];
+		uint64_t fc = 0, sched = 0xff, xoff = 0xff;
+		uint64_t fe = 0xff, retire = 0xff, ovf = 0xff, bc = 0;
+
+		if (swp && qbman_fq_query_state(swp, dq->fqid, &fqstate) == 0) {
+			fc = qbman_fq_state_frame_count(&fqstate);
+			sched = qbman_fq_state_schedstate(&fqstate);
+			xoff = qbman_fq_state_xoff(&fqstate);
+			fe = qbman_fq_state_force_eligible(&fqstate);
+			retire = qbman_fq_state_retirement_pending(&fqstate);
+			ovf = qbman_fq_state_overflow_error(&fqstate);
+			bc = qbman_fq_state_byte_count(&fqstate);
+		}
+		dpaa2_qbman_rx_frm_accum[pid][j] += fc;
 		xstats[i].id = i;
-		xstats[i].value = 0;
-		i++;
+		xstats[i++].value = dpaa2_qbman_rx_frm_accum[pid][j];
+		xstats[i].id = i;
+		xstats[i++].value = sched;
+		xstats[i].id = i;
+		xstats[i++].value = xoff;
+		{
+			struct dpaa2_dpio_dev *sub = rte_atomic_load_explicit(
+				&dq->napi_sub_dpio, rte_memory_order_relaxed);
+
+			xstats[i].id = i;
+			xstats[i++].value = sub ? sub->index : 0xffff;
+			xstats[i].id = i;
+			xstats[i++].value = dq->napi_armed;
+			xstats[i].id = i;
+			xstats[i++].value = dq->napi_dpcon ?
+				dq->napi_dpcon->dpcon_id : 0xffff;
+			xstats[i].id = i;
+			xstats[i++].value = dq->napi_cdan_count;
+			xstats[i].id = i;
+			xstats[i++].value = (swp && qbman_fq_query(swp,
+					dq->fqid, &fqattr) == 0) ?
+				qbman_fq_attr_get_destwq(&fqattr) : 0xffff;
+			xstats[i].id = i;
+			xstats[i++].value = fe;
+			xstats[i].id = i;
+			xstats[i++].value = retire;
+			xstats[i].id = i;
+			xstats[i++].value = ovf;
+			xstats[i].id = i;
+			xstats[i++].value = bc;
+			xstats[i].id = i;
+			xstats[i++].value = dq->napi_poll_count;
+			xstats[i].id = i;
+			xstats[i++].value = dq->napi_deq_count;
+			/* portal interrupt regs of the subscribed dpio: ISR (DQRI
+			 * status, w1c/latched), IER (enabled), IIR (inhibit/mask).
+			 * A wedged wakeup shows here: ISR DQRI=1 + IIR=0 -> latched,
+			 * MSI edge lost; ISR=0 -> no CDAN reached the portal.
+			 */
+			xstats[i].id = i;
+			xstats[i++].value = sub ?
+				qbman_swp_interrupt_read_status(sub->sw_portal) :
+				0xffffffff;
+			xstats[i].id = i;
+			xstats[i++].value = sub ?
+				qbman_swp_interrupt_get_trigger(sub->sw_portal) :
+				0xffffffff;
+			xstats[i].id = i;
+			xstats[i++].value = sub ?
+				(uint32_t)qbman_swp_interrupt_get_inhibit(
+					sub->sw_portal) : 0xffffffff;
+			xstats[i].id = i;
+			xstats[i++].value = sub ? sub->ethrx_intr_refcnt : 0;
+			xstats[i].id = i;
+			xstats[i++].value = dq->napi_intr_enable_cnt;
+			xstats[i].id = i;
+			xstats[i++].value = dq->napi_intr_disable_cnt;
+			xstats[i].id = i;
+			xstats[i++].value = dq->napi_arm_fqne;
+			xstats[i].id = i;
+			xstats[i++].value = dq->napi_cdan_enable_cnt;
+		}
+	}
+	for (j = 0; j < dev->data->nb_tx_queues; j++) {
+		uint64_t deq, rej;
+
+		dpaa2_ceetm_tx_query(dpni, priv, j, &deq, &rej);
+		xstats[i].id = i;
+		xstats[i++].value = deq - dpaa2_ceetm_deq_base[pid][j];
+		xstats[i].id = i;
+		xstats[i++].value = rej - dpaa2_ceetm_rej_base[pid][j];
 	}
 
 	return i;
@@ -2214,22 +2356,81 @@ err:
 }
 
 static int
-dpaa2_xstats_get_names(__rte_unused struct rte_eth_dev *dev,
+dpaa2_xstats_get_names(struct rte_eth_dev *dev,
 	struct rte_eth_xstat_name *xstats_names,
 	unsigned int limit)
 {
-	unsigned int i, stat_cnt = RTE_DIM(dpaa2_xstats_strings);
+	unsigned int i, j, stat_cnt = RTE_DIM(dpaa2_xstats_strings);
+	uint16_t pid = dev->data->port_id;
+	unsigned int total = stat_cnt +
+		dev->data->nb_rx_queues * DPAA2_RXQ_DBG_STATS +
+		dev->data->nb_tx_queues * DPAA2_TXQ_DBG_STATS;
 
-	if (limit < stat_cnt)
-		return stat_cnt;
+	if (limit < total)
+		return total;
 
-	if (xstats_names != NULL)
-		for (i = 0; i < stat_cnt; i++)
-			strlcpy(xstats_names[i].name,
-				dpaa2_xstats_strings[i].name,
-				sizeof(xstats_names[i].name));
+	if (xstats_names == NULL)
+		return total;
 
-	return stat_cnt;
+	for (i = 0; i < stat_cnt; i++)
+		strlcpy(xstats_names[i].name,
+			dpaa2_xstats_strings[i].name,
+			sizeof(xstats_names[i].name));
+
+	for (j = 0; j < dev->data->nb_rx_queues; j++) {
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_qbman_frame_count", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_qbman_fq_state_schedstate", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_qbman_fq_state_xoff", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_napi_sub_dpio", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_napi_armed", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_napi_dpcon_id", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_napi_cdan_count", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_fq_destwq", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_qbman_fq_state_force_eligible", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_qbman_fq_state_retirement_pending", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_qbman_fq_state_overflow_error", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_qbman_byte_count", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_napi_poll_count", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_napi_deq_count", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_napi_isr", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_napi_ier", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_napi_iir", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_napi_refcnt", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_napi_intr_enable_cnt", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_napi_intr_disable_cnt", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_napi_arm_fqne", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%urxq%u_napi_cdan_enable_cnt", pid, j);
+	}
+	for (j = 0; j < dev->data->nb_tx_queues; j++) {
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%utxq%u_ceetm_dequeue_frames", pid, j);
+		snprintf(xstats_names[i++].name, RTE_ETH_XSTATS_NAME_SIZE,
+			 "p%utxq%u_ceetm_reject_frames", pid, j);
+	}
+
+	return total;
 }
 
 static int
@@ -2352,6 +2553,15 @@ dpaa2_dev_stats_reset(struct rte_eth_dev *dev)
 		if (dpaa2_q)
 			dpaa2_q->tx_pkts = 0;
 	}
+
+	memset(dpaa2_qbman_rx_frm_accum[dev->data->port_id], 0,
+	       sizeof(dpaa2_qbman_rx_frm_accum[0]));
+
+	/* baseline the CEETM counters so xstats report deltas since this reset */
+	for (i = 0; i < priv->nb_tx_queues; i++)
+		dpaa2_ceetm_tx_query(dpni, priv, i,
+				     &dpaa2_ceetm_deq_base[dev->data->port_id][i],
+				     &dpaa2_ceetm_rej_base[dev->data->port_id][i]);
 
 	return 0;
 
@@ -3095,8 +3305,16 @@ dpaa2_napi_drain_portal(struct dpaa2_dpio_dev *dpio)
 {
 	const struct qbman_result *dq;
 
-	while ((dq = qbman_swp_dqrr_next(dpio->sw_portal)))
+	while ((dq = qbman_swp_dqrr_next(dpio->sw_portal))) {
+		if (qbman_result_is_CDAN(dq)) {
+			struct dpaa2_queue *cq = (void *)(uintptr_t)
+				qbman_result_SCN_ctx(dq);
+
+			if (cq)
+				cq->napi_cdan_count++;
+		}
 		qbman_swp_dqrr_consume(dpio->sw_portal, dq);
+	}
 	qbman_swp_interrupt_clear_status(dpio->sw_portal, 0xffffffff);
 }
 
@@ -3121,6 +3339,7 @@ dpaa2_napi_quiesce_vdq(struct dpaa2_queue *dpaa2_q)
 	 */
 	if (!qbman_result_DQ_is_pull_complete(dq) ||
 	    (qbman_result_DQ_flags(dq) & QBMAN_DQ_STAT_VALIDFRAME)) {
+		dpaa2_q->napi_eagain++;
 		return -EAGAIN;
 	}
 	/* empty pull-complete: consume the token, drop the storage for a fresh pull */
@@ -3220,6 +3439,7 @@ dpaa2_dev_rx_queue_intr_enable(struct rte_eth_dev *dev, uint16_t queue_id)
 		return -EIO;
 	if (!dpaa2_q->napi_dpcon)
 		return -ENOTSUP;	/* no channel -> caller keeps polling */
+	dpaa2_q->napi_intr_enable_cnt++;
 
 	if (dpaa2_affine_qbman_ethrx_swp())
 		return -EIO;
@@ -3268,6 +3488,7 @@ dpaa2_dev_rx_queue_intr_enable(struct rte_eth_dev *dev, uint16_t queue_id)
 		/* initial arm: nothing published; re-arm: state kept. Don't sleep. */
 		return -EAGAIN;
 	}
+	dpaa2_q->napi_cdan_enable_cnt++;
 
 	if (!dpaa2_q->napi_armed) {
 		dpaa2_q->napi_armed = 1;
@@ -3292,6 +3513,7 @@ dpaa2_dev_rx_queue_intr_disable(struct rte_eth_dev *dev, uint16_t queue_id)
 	uint64_t ev;
 	ssize_t nb;
 
+	dpaa2_q->napi_intr_disable_cnt++;
 	dpio = rte_atomic_load_explicit(&dpaa2_q->napi_sub_dpio, rte_memory_order_acquire);
 	if (dpio && dpaa2_q->napi_armed) {
 		dpaa2_q->napi_armed = 0;

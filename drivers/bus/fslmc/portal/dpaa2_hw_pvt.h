@@ -204,6 +204,14 @@ struct __rte_cache_aligned dpaa2_queue {
 	struct dpaa2_dpcon_dev *napi_dpcon;	/*!< notif channel, NULL = napi off */
 	RTE_ATOMIC(struct dpaa2_dpio_dev *) napi_sub_dpio;	/*!< subscribed portal or NULL */
 	uint8_t napi_armed;			/*!< this queue requests DQRI wakeups */
+	uint64_t napi_cdan_count;		/*!< CDAN notifications received (debug) */
+	uint64_t napi_eagain;			/*!< in-flight VDQ held a frame at sleep entry (debug) */
+	uint64_t napi_arm_fqne;			/*!< FQ non-empty when arm completed (debug) */
+	uint64_t napi_poll_count;		/*!< channel-pull bursts run (debug) */
+	uint64_t napi_deq_count;		/*!< frames dequeued by this queue (debug) */
+	uint64_t napi_intr_enable_cnt;		/*!< rx_queue_intr_enable calls (debug) */
+	uint64_t napi_intr_disable_cnt;		/*!< rx_queue_intr_disable calls (debug) */
+	uint64_t napi_cdan_enable_cnt;		/*!< qbman_swp_CDAN_enable calls (debug) */
 };
 
 struct swp_active_dqs {

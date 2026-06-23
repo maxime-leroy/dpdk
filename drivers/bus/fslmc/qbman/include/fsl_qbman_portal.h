@@ -116,6 +116,7 @@ void qbman_swp_interrupt_set_vanish(struct qbman_swp *p, uint32_t mask);
  *
  * Return the settings in SWP_ISR register.
  */
+__rte_internal
 uint32_t qbman_swp_interrupt_read_status(struct qbman_swp *p);
 
 /**
@@ -164,6 +165,7 @@ void qbman_swp_intr_timeout_write(struct qbman_swp *p, uint32_t mask);
  *
  * Return the settings in SWP_IER register.
  */
+__rte_internal
 uint32_t qbman_swp_interrupt_get_trigger(struct qbman_swp *p);
 
 /**
@@ -181,6 +183,7 @@ void qbman_swp_interrupt_set_trigger(struct qbman_swp *p, uint32_t mask);
  *
  * Return the settings in SWP_IIR register.
  */
+__rte_internal
 int qbman_swp_interrupt_get_inhibit(struct qbman_swp *p);
 
 /**
@@ -569,6 +572,7 @@ int qbman_result_is_FQDAN(const struct qbman_result *dq);
  *
  * Return 1 if this is CDAN.
  */
+__rte_internal
 int qbman_result_is_CDAN(const struct qbman_result *dq);
 
 /**
@@ -764,6 +768,7 @@ uint32_t qbman_result_SCN_rid(const struct qbman_result *scn);
  *
  * Return the context.
  */
+__rte_internal
 uint64_t qbman_result_SCN_ctx(const struct qbman_result *scn);
 
 /* Type-specific "resource IDs". Mainly for illustration purposes, though it
