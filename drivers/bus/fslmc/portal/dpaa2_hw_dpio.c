@@ -149,7 +149,6 @@ dpaa2_core_cluster_sdest(int cpu_id)
 	return dpaa2_core_cluster_base + x;
 }
 
-#ifdef RTE_EVENT_DPAA2
 static void
 dpaa2_affine_dpio_intr_to_respective_core(int32_t dpio_id, int cpu_id)
 {
@@ -204,7 +203,19 @@ dpaa2_affine_dpio_intr_to_respective_core(int32_t dpio_id, int cpu_id)
 
 	fclose(file);
 }
-#endif /* RTE_EVENT_DPAA2 */
+
+/* Pin the dpio's MSI IRQ to the calling lcore's core (best-effort), so a
+ * worker sleeping on this portal's eventfd is woken on its own core.
+ */
+RTE_EXPORT_INTERNAL_SYMBOL(dpaa2_dpio_affine_intr_to_core)
+void
+dpaa2_dpio_affine_intr_to_core(int32_t dpio_id)
+{
+	int cpu_id = dpaa2_get_core_id();
+
+	if (cpu_id >= 0)
+		dpaa2_affine_dpio_intr_to_respective_core(dpio_id, cpu_id);
+}
 
 /* threshold: DQRR fill raising DQRI (< ring depth); timeout: holdoff in ITP units.
  * Per-mode values from the caller (eventdev vs rx-queue intr).
@@ -308,33 +319,26 @@ dpaa2_configure_stashing(struct dpaa2_dpio_dev *dpio_dev, int cpu_id, bool ethrx
 	}
 
 #ifdef RTE_EVENT_DPAA2
-	{
-		/* the rx-queue-interrupt portal (ethrx) defaults to an immediate
-		 * DQRI (threshold 1, holdoff 0) and waits on the application epoll;
-		 * the event portal coalesces (3, 0xFF) and owns a private epoll.
-		 * Each mode is tunable through its own env vars.
-		 */
-		const char *thr_env = "DPAA2_PORTAL_INTR_THRESHOLD";
-		const char *to_env = "DPAA2_PORTAL_INTR_TIMEOUT";
+	/* Only the event PMD's portal is set up here (coalesced DQRI, private
+	 * epoll). The net rx-interrupt portal (ethrx) is configured by the net
+	 * PMD in rx_queue_intr_enable, so do not touch it here.
+	 */
+	if (!ethrx) {
 		int threshold = 3, timeout = 0xFF;
 
-		if (ethrx) {
-			thr_env = "DPAA2_PORTAL_ETHRX_INTR_THRESHOLD";
-			to_env = "DPAA2_PORTAL_ETHRX_INTR_TIMEOUT";
-			threshold = 1;
-			timeout = 0;
-		}
-		if (getenv(thr_env))
-			threshold = atoi(getenv(thr_env));
-		if (getenv(to_env))
-			sscanf(getenv(to_env), "%x", &timeout);
+		if (getenv("DPAA2_PORTAL_INTR_THRESHOLD"))
+			threshold = atoi(getenv("DPAA2_PORTAL_INTR_THRESHOLD"));
+		if (getenv("DPAA2_PORTAL_INTR_TIMEOUT"))
+			sscanf(getenv("DPAA2_PORTAL_INTR_TIMEOUT"), "%x", &timeout);
 
-		if (dpaa2_dpio_intr_init(dpio_dev, threshold, timeout, !ethrx)) {
+		if (dpaa2_dpio_intr_init(dpio_dev, threshold, timeout, true)) {
 			DPAA2_BUS_ERR("Interrupt registration failed for dpio");
 			return -1;
 		}
+		dpaa2_affine_dpio_intr_to_respective_core(dpio_dev->hw_id, cpu_id);
 	}
-	dpaa2_affine_dpio_intr_to_respective_core(dpio_dev->hw_id, cpu_id);
+#else
+	RTE_SET_USED(ethrx);
 #endif
 
 	return 0;
