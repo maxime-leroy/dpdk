@@ -128,6 +128,7 @@ rte_dpaa2_close_dpcon_device(int object_id)
 
 	if (dpcon_dev) {
 		rte_dpaa2_free_dpcon_dev(dpcon_dev);
+		dpcon_disable(&dpcon_dev->dpcon, CMD_PRI_LOW, dpcon_dev->token);
 		dpcon_close(&dpcon_dev->dpcon, CMD_PRI_LOW, dpcon_dev->token);
 		TAILQ_REMOVE(&dpcon_dev_list, dpcon_dev, next);
 		rte_free(dpcon_dev);
