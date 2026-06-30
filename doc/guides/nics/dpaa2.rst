@@ -579,6 +579,12 @@ Other Limitations
 
 - RSS hash key cannot be modified.
 - RSS RETA cannot be configured.
+- Under ``RTE_ETH_RSS_LEVEL_INNERMOST``, the IP hash also covers the
+  outermost IP, not only the innermost one. The hardware extracts no IP
+  at the innermost index for non-tunnelled frames, so the outer IP is
+  added to keep RSS working on plain traffic. As a result, tunnelled
+  flows with the same inner header but different outer IPs may be
+  distributed to different queues.
 
 .. _dptmapi:
 
