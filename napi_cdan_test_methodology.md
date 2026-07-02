@@ -36,42 +36,49 @@ mode (rxqs = number of datapath cores, one DPCON/portal per worker):
 
 ## Test procedure
 
-1. Idle -> sleep. No traffic. After the idle windows the worker blocks in
-   `rte_epoll_wait`. Check: worker CPU drops to ~0 (`top -H`), busy_cycles
-   stops advancing while total_cycles keeps going (`grcli stats software`).
+1. Wake, no-loss and latency (ping, idle link). With the xconnect up and grout
+   `--napi`, `ping` through it at a low rate from the peer. Pass: no loss, i.e.
+   the sleeping worker wakes on each CDAN; a lost-wake wedge shows as ping loss
+   with the FQ frame_count climbing. RTT also measures the wake latency:
+   compare `--napi` against poll-mode (`-p`); the extra is one CDAN wake plus a
+   channel pull, bounded by the ITPR holdoff (0 here, so the first CDAN raises
+   the DQRI immediately).
 
-2. Wake on frame. Send one frame into p0. Check: it is forwarded to p1;
-   `napi_cdan_count` and `napi_deq_count` on that queue increment by >=1;
-   wake is immediate (arm sets ITP holdoff 0).
+2. Real NAPI sleep vs silent busy-poll. `grcli stats hardware`: `rx_burst_1_pkts`
+   near 100% means the worker genuinely sleeps and wakes per single packet
+   (busy-poll instead returns large bursts). This distinguishes a real sleep
+   from a fallback to polling.
 
-3. Idle/busy cycling. Alternate bursts and idle gaps repeatedly. Check: every
-   idle->busy edge wakes (no lost or stuck wake), `napi_cdan_count` tracks the
-   number of wakes, `napi_eagain`/`napi_arm_fqne` stay ~0 (no missed wake at
-   the arm/sleep race window).
+3. Wedge watch. `grcli stats hardware zero` (plain hides zero-valued xstats).
+   Healthy: `cdan_count` / `poll_count` / `deq_count` keep advancing and the FQ
+   `schedstate` drains back to 2. Wedge: those counts frozen with frame_count
+   climbing and `schedstate` stuck at 3 (scheduled, undrained), live `isr=4`
+   (DQRI asserted) + `iir=0` (unmasked) = a lost CDAN wake on the sleeping
+   worker; a continuously loaded sibling that keeps the core awake hides it.
 
-4. Line rate. Offer full line rate. Check: throughput and drop rate equal
-   poll-mode (`-p` without `-n`); the interrupt is only the idle->busy
-   doorbell, the worker busy-polls under load.
+4. Throughput (trex, line rate). Drive line rate with trex (or pktgen) and
+   compare `--napi` against poll-mode (`-p` without `-n`); under load the
+   worker busy-polls, so they should match. Note the known channel-dequeue tax
+   of the NAPI path (single-core I/O ~5.9 Mpps vs l2fwd ~10.8 Mpps).
 
-5. Multi-queue spread. Send many flows so RSS spreads across all rxqs. Check:
-   each queue's `napi_deq_count` is non-zero and each worker sleeps/wakes
-   independently (disabling one queue must not stall a sibling on the same
-   portal).
-
-6. Teardown. Disarm on the polling lcore before stop/close (bring the ports
-   down / stop grout after traffic). Check: clean shutdown, no hang. Stopping
-   without disarming first fires the "rxq flow N freed while armed" warning.
-
-Pass: idle worker core near 0% CPU and forwarding resumes on the next frame;
-under load throughput/drops match poll-mode; cdan/deq increment on wake while
-eagain/arm_fqne stay ~0 across many idle/busy transitions; teardown is clean.
+5. Re-home. Queues are runtime re-homable to another core without a port
+   restart; forwarding follows the worker.
 
 ## Reference commands
 
-Per-queue CDAN counters (the functional probe: cdan/deq increment on wake,
-eagain/arm_fqne stay ~0):
+Wake / no-loss and latency from the peer (loss = lost-wake wedge; RTT vs
+poll-mode = the wake latency added by --napi):
 
-    grcli stats hardware pattern "*napi*"
+    ping -i 0.2 <peer>
+
+Per-queue CDAN counters, including zero-valued ones (plain output hides them);
+cdan/poll/deq must keep advancing, frozen with frames piling = wedge:
+
+    grcli stats hardware zero pattern "*napi*"
+
+Real NAPI sleep vs busy-poll (rx_burst_1_pkts near 100% = per-packet wake):
+
+    grcli stats hardware pattern "*burst*"
 
 Per-thread CPU: an idle worker's core drops to ~0, a busy one sits near 100:
 
