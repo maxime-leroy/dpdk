@@ -34,6 +34,63 @@ mode (rxqs = number of datapath cores, one DPCON/portal per worker):
     grcli interface set port p0 domain p1
     grcli interface set port p1 domain p0   # domain is per-port; set both
 
+## Test procedure
+
+1. Idle -> sleep. No traffic. After the idle windows the worker blocks in
+   `rte_epoll_wait`. Check: worker CPU drops to ~0 (`top -H`), busy_cycles
+   stops advancing while total_cycles keeps going (`grcli stats software`).
+
+2. Wake on frame. Send one frame into p0. Check: it is forwarded to p1;
+   `napi_cdan_count` and `napi_deq_count` on that queue increment by >=1;
+   wake is immediate (arm sets ITP holdoff 0).
+
+3. Idle/busy cycling. Alternate bursts and idle gaps repeatedly. Check: every
+   idle->busy edge wakes (no lost or stuck wake), `napi_cdan_count` tracks the
+   number of wakes, `napi_eagain`/`napi_arm_fqne` stay ~0 (no missed wake at
+   the arm/sleep race window).
+
+4. Line rate. Offer full line rate. Check: throughput and drop rate equal
+   poll-mode (`-p` without `-n`); the interrupt is only the idle->busy
+   doorbell, the worker busy-polls under load.
+
+5. Multi-queue spread. Send many flows so RSS spreads across all rxqs. Check:
+   each queue's `napi_deq_count` is non-zero and each worker sleeps/wakes
+   independently (disabling one queue must not stall a sibling on the same
+   portal).
+
+6. Teardown. Disarm on the polling lcore before stop/close (bring the ports
+   down / stop grout after traffic). Check: clean shutdown, no hang. Stopping
+   without disarming first fires the "rxq flow N freed while armed" warning.
+
+Pass: idle worker core near 0% CPU and forwarding resumes on the next frame;
+under load throughput/drops match poll-mode; cdan/deq increment on wake while
+eagain/arm_fqne stay ~0 across many idle/busy transitions; teardown is clean.
+
+## Reference commands
+
+Per-queue CDAN counters (the functional probe: cdan/deq increment on wake,
+eagain/arm_fqne stay ~0):
+
+    grcli stats hardware pattern "*napi*"
+
+Per-thread CPU: an idle worker's core drops to ~0, a busy one sits near 100:
+
+    top -H -p "$(pidof grout)"
+
+Busy vs total cycles (the interrupt sleep is counted in total, not busy):
+
+    grcli stats software
+
+Throughput and drops, to compare --napi against poll-mode (`-p` without `-n`):
+
+    grcli stats hardware pattern "*packets*"
+
+Drive line rate from a generator on the link partner (testpmd, trex or
+pktgen) and read the rx/tx deltas; under load --napi should match poll-mode.
+Reset counters between runs:
+
+    grcli stats reset
+
 ## Alternative harness: l3fwd-power (independent of grout)
 
 `examples/l3fwd-power` is the DPDK sample app for Rx interrupt mode: idle
