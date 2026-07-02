@@ -905,7 +905,8 @@ static int event_register(struct lcore_conf *qconf)
 						RTE_EPOLL_PER_THREAD,
 						RTE_INTR_EVENT_ADD,
 						(void *)((uintptr_t)data));
-		if (ret)
+		/* -EEXIST: queue shares an already-registered eventfd */
+		if (ret && ret != -EEXIST)
 			return ret;
 	}
 
