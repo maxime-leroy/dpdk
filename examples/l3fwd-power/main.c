@@ -937,7 +937,12 @@ static int event_register(struct lcore_conf *qconf)
 						RTE_EPOLL_PER_THREAD,
 						RTE_INTR_EVENT_ADD,
 						(void *)((uintptr_t)data));
-		if (ret)
+		/*
+		 * Queues polled on the same lcore may share one interrupt fd,
+		 * so registering the second onward returns -EEXIST; treat it
+		 * as success.
+		 */
+		if (ret && ret != -EEXIST)
 			return ret;
 	}
 
