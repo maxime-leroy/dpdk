@@ -863,12 +863,13 @@ sleep_until_rx_interrupt(int num, int lcore)
 	return 0;
 }
 
-static void turn_on_off_intr(struct lcore_conf *qconf, bool on)
+static void
+rx_intr_disable_all(struct lcore_conf *qconf)
 {
-	int i;
 	struct lcore_rx_queue *rx_queue;
 	uint16_t queue_id;
 	uint16_t port_id;
+	int i;
 
 	for (i = 0; i < qconf->n_rx_queue; ++i) {
 		rx_queue = &(qconf->rx_queue_list[i]);
@@ -876,12 +877,45 @@ static void turn_on_off_intr(struct lcore_conf *qconf, bool on)
 		queue_id = rx_queue->queue_id;
 
 		rte_spinlock_lock(&(locks[port_id]));
-		if (on)
-			rte_eth_dev_rx_intr_enable(port_id, queue_id);
-		else
-			rte_eth_dev_rx_intr_disable(port_id, queue_id);
+		rte_eth_dev_rx_intr_disable(port_id, queue_id);
 		rte_spinlock_unlock(&(locks[port_id]));
 	}
+}
+
+static int
+rx_intr_enable_all(struct lcore_conf *qconf)
+{
+	struct lcore_rx_queue *rx_queue;
+	uint16_t queue_id;
+	uint16_t port_id;
+	int i, ret;
+
+	for (i = 0; i < qconf->n_rx_queue; ++i) {
+		rx_queue = &(qconf->rx_queue_list[i]);
+		port_id = rx_queue->port_id;
+		queue_id = rx_queue->queue_id;
+
+		rte_spinlock_lock(&(locks[port_id]));
+		ret = rte_eth_dev_rx_intr_enable(port_id, queue_id);
+		rte_spinlock_unlock(&(locks[port_id]));
+		if (ret != 0)
+			goto fail;
+	}
+
+	return 0;
+
+fail:
+	while (--i >= 0) {
+		rx_queue = &(qconf->rx_queue_list[i]);
+		port_id = rx_queue->port_id;
+		queue_id = rx_queue->queue_id;
+
+		rte_spinlock_lock(&(locks[port_id]));
+		rte_eth_dev_rx_intr_disable(port_id, queue_id);
+		rte_spinlock_unlock(&(locks[port_id]));
+	}
+
+	return ret;
 }
 
 static int event_register(struct lcore_conf *qconf)
@@ -923,6 +957,7 @@ static int main_intr_loop(__rte_unused void *dummy)
 	uint32_t lcore_rx_idle_count = 0;
 	uint32_t lcore_idle_hint = 0;
 	int intr_en = 0;
+	int ret;
 
 	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) /
 				   US_PER_S * BURST_TX_DRAIN_US;
@@ -1054,11 +1089,17 @@ start_rx:
 			else {
 				/* suspend until rx interrupt triggers */
 				if (intr_en) {
-					turn_on_off_intr(qconf, 1);
+					ret = rx_intr_enable_all(qconf);
+					if (ret == -EAGAIN)
+						goto start_rx;
+					if (ret != 0) {
+						intr_en = 0;
+						continue;
+					}
 					sleep_until_rx_interrupt(
 							qconf->n_rx_queue,
 							lcore_id);
-					turn_on_off_intr(qconf, 0);
+					rx_intr_disable_all(qconf);
 					/**
 					 * start receiving packets immediately
 					 */
@@ -1210,6 +1251,7 @@ main_legacy_loop(__rte_unused void *dummy)
 	uint32_t lcore_rx_idle_count = 0;
 	uint32_t lcore_idle_hint = 0;
 	int intr_en = 0;
+	int ret;
 
 	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * BURST_TX_DRAIN_US;
 
@@ -1372,11 +1414,17 @@ start_rx:
 			else {
 				/* suspend until rx interrupt triggers */
 				if (intr_en) {
-					turn_on_off_intr(qconf, 1);
+					ret = rx_intr_enable_all(qconf);
+					if (ret == -EAGAIN)
+						goto start_rx;
+					if (ret != 0) {
+						intr_en = 0;
+						continue;
+					}
 					sleep_until_rx_interrupt(
 							qconf->n_rx_queue,
 							lcore_id);
-					turn_on_off_intr(qconf, 0);
+					rx_intr_disable_all(qconf);
 					/**
 					 * start receiving packets immediately
 					 */
