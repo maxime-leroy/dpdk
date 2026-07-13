@@ -949,6 +949,32 @@ static int event_register(struct lcore_conf *qconf)
 	return 0;
 }
 
+/*
+ * Return true if any Rx queue on this lcore already holds traffic. Used to
+ * avoid sleeping after arming when a packet arrived during the arm window:
+ * with edge-triggered interrupts, a queue that is already non-empty may not
+ * raise a new wakeup.
+ */
+static bool
+rx_queue_pending(struct lcore_conf *qconf)
+{
+	struct lcore_rx_queue *rx_queue;
+	uint16_t queue_id;
+	uint16_t port_id;
+	int i;
+
+	for (i = 0; i < qconf->n_rx_queue; ++i) {
+		rx_queue = &(qconf->rx_queue_list[i]);
+		port_id = rx_queue->port_id;
+		queue_id = rx_queue->queue_id;
+
+		if (rte_eth_rx_queue_count(port_id, queue_id) > 0)
+			return true;
+	}
+
+	return false;
+}
+
 /* Main processing loop. 8< */
 static int main_intr_loop(__rte_unused void *dummy)
 {
@@ -1111,9 +1137,10 @@ start_rx:
 						}
 						intr_registered = 1;
 					}
-					sleep_until_rx_interrupt(
-							qconf->n_rx_queue,
-							lcore_id);
+					if (!rx_queue_pending(qconf))
+						sleep_until_rx_interrupt(
+								qconf->n_rx_queue,
+								lcore_id);
 					rx_intr_disable_all(qconf);
 					/**
 					 * start receiving packets immediately
@@ -1446,9 +1473,10 @@ start_rx:
 						}
 						intr_registered = 1;
 					}
-					sleep_until_rx_interrupt(
-							qconf->n_rx_queue,
-							lcore_id);
+					if (!rx_queue_pending(qconf))
+						sleep_until_rx_interrupt(
+								qconf->n_rx_queue,
+								lcore_id);
 					rx_intr_disable_all(qconf);
 					/**
 					 * start receiving packets immediately
