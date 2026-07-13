@@ -956,7 +956,8 @@ static int main_intr_loop(__rte_unused void *dummy)
 	struct lcore_rx_queue *rx_queue;
 	uint32_t lcore_rx_idle_count = 0;
 	uint32_t lcore_idle_hint = 0;
-	int intr_en = 0;
+	int intr_registered = 0;
+	int intr_en = 1;
 	int ret;
 
 	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) /
@@ -983,12 +984,6 @@ static int main_intr_loop(__rte_unused void *dummy)
 				" -- lcoreid=%u portid=%u rxqueueid=%" PRIu16 "\n",
 				lcore_id, portid, queueid);
 	}
-
-	/* add into event wait list */
-	if (event_register(qconf) == 0)
-		intr_en = 1;
-	else
-		RTE_LOG(INFO, L3FWD_POWER, "RX interrupt won't enable.\n");
 
 	while (!is_done()) {
 		stats[lcore_id].nb_iteration_looped++;
@@ -1095,6 +1090,21 @@ start_rx:
 					if (ret != 0) {
 						intr_en = 0;
 						continue;
+					}
+					/*
+					 * Register in the epoll set once, after
+					 * the queues are armed: some PMDs expose
+					 * the interrupt fd only when the queue is
+					 * enabled. Keep the entry installed for
+					 * the lifetime of the loop.
+					 */
+					if (!intr_registered) {
+						if (event_register(qconf) != 0) {
+							rx_intr_disable_all(qconf);
+							intr_en = 0;
+							continue;
+						}
+						intr_registered = 1;
 					}
 					sleep_until_rx_interrupt(
 							qconf->n_rx_queue,
@@ -1250,7 +1260,8 @@ main_legacy_loop(__rte_unused void *dummy)
 	enum freq_scale_hint_t lcore_scaleup_hint;
 	uint32_t lcore_rx_idle_count = 0;
 	uint32_t lcore_idle_hint = 0;
-	int intr_en = 0;
+	int intr_registered = 0;
+	int intr_en = 1;
 	int ret;
 
 	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * BURST_TX_DRAIN_US;
@@ -1275,12 +1286,6 @@ main_legacy_loop(__rte_unused void *dummy)
 		RTE_LOG(INFO, L3FWD_POWER, " -- lcoreid=%u portid=%u "
 			"rxqueueid=%" PRIu16 "\n", lcore_id, portid, queueid);
 	}
-
-	/* add into event wait list */
-	if (event_register(qconf) == 0)
-		intr_en = 1;
-	else
-		RTE_LOG(INFO, L3FWD_POWER, "RX interrupt won't enable.\n");
 
 	while (!is_done()) {
 		stats[lcore_id].nb_iteration_looped++;
@@ -1420,6 +1425,21 @@ start_rx:
 					if (ret != 0) {
 						intr_en = 0;
 						continue;
+					}
+					/*
+					 * Register in the epoll set once, after
+					 * the queues are armed: some PMDs expose
+					 * the interrupt fd only when the queue is
+					 * enabled. Keep the entry installed for
+					 * the lifetime of the loop.
+					 */
+					if (!intr_registered) {
+						if (event_register(qconf) != 0) {
+							rx_intr_disable_all(qconf);
+							intr_en = 0;
+							continue;
+						}
+						intr_registered = 1;
 					}
 					sleep_until_rx_interrupt(
 							qconf->n_rx_queue,
