@@ -9,6 +9,8 @@
 #include <sys/types.h>
 #include <string.h>
 #include <sys/queue.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <stdarg.h>
 #include <errno.h>
 #include <getopt.h>
@@ -143,6 +145,9 @@ static int promiscuous_on = 0;
 /* NUMA is enabled by default. */
 static int numa_on = 1;
 volatile bool quit_signal;
+/* eventfd to wake idle workers out of a blocking rte_epoll_wait() at exit */
+static int wakeup_fd = -1;
+static struct rte_epoll_event wakeup_event[RTE_MAX_LCORE];
 /* timer to update telemetry every 500ms */
 static struct rte_timer telemetry_timer;
 
@@ -420,10 +425,14 @@ static int is_done(void)
 static void
 signal_exit_now(int sigtype)
 {
+	uint64_t one = 1;
 
-	if (sigtype == SIGINT)
+	if (sigtype == SIGINT) {
 		quit_signal = true;
-
+		/* interrupt mode only: wake a worker blocked in rte_epoll_wait() */
+		if (wakeup_fd >= 0)
+			(void)write(wakeup_fd, &one, sizeof(one));
+	}
 }
 
 /*  Frequency scale down timer callback */
@@ -835,7 +844,7 @@ sleep_until_rx_interrupt(int num, int lcore)
 	static alignas(RTE_CACHE_LINE_SIZE) struct {
 		bool wakeup;
 	} status[RTE_MAX_LCORE];
-	struct rte_epoll_event event[num];
+	struct rte_epoll_event event[num + 1];
 	int n, i;
 	uint16_t port_id;
 	uint16_t queue_id;
@@ -847,8 +856,10 @@ sleep_until_rx_interrupt(int num, int lcore)
 				rte_lcore_id());
 	}
 
-	n = rte_epoll_wait(RTE_EPOLL_PER_THREAD, event, num, 10);
+	n = rte_epoll_wait(RTE_EPOLL_PER_THREAD, event, num + 1, -1);
 	for (i = 0; i < n; i++) {
+		if (event[i].fd == wakeup_fd)
+			continue;
 		data = event[i].epdata.data;
 		port_id = ((uintptr_t)data) >> (sizeof(uint16_t) * CHAR_BIT);
 		queue_id = ((uintptr_t)data) &
@@ -921,6 +932,7 @@ fail:
 static int event_register(struct lcore_conf *qconf)
 {
 	struct lcore_rx_queue *rx_queue;
+	struct rte_epoll_event *wev;
 	uint16_t queueid;
 	uint16_t portid;
 	uint32_t data;
@@ -942,6 +954,16 @@ static int event_register(struct lcore_conf *qconf)
 		 * so registering the second onward returns -EEXIST; treat it
 		 * as success.
 		 */
+		if (ret && ret != -EEXIST)
+			return ret;
+	}
+
+	/* also watch the shutdown eventfd so a blocking wait wakes at exit */
+	if (wakeup_fd >= 0) {
+		wev = &wakeup_event[rte_lcore_id()];
+		wev->epdata.event = EPOLLIN | EPOLLPRI;
+		ret = rte_epoll_ctl(RTE_EPOLL_PER_THREAD, EPOLL_CTL_ADD,
+				    wakeup_fd, wev);
 		if (ret && ret != -EEXIST)
 			return ret;
 	}
@@ -3034,6 +3056,10 @@ main(int argc, char **argv)
 		rte_eal_mp_remote_launch(main_telemetry_loop, NULL,
 						SKIP_MAIN);
 	} else if (app_mode == APP_MODE_INTERRUPT) {
+		wakeup_fd = eventfd(0, EFD_NONBLOCK);
+		if (wakeup_fd < 0)
+			rte_exit(EXIT_FAILURE, "eventfd() failed: %s\n",
+				 strerror(errno));
 		rte_eal_mp_remote_launch(main_intr_loop, NULL, CALL_MAIN);
 	} else if (app_mode == APP_MODE_PMD_MGMT) {
 		/* reuse telemetry loop for PMD power management mode */
