@@ -244,7 +244,7 @@ static int
 setup_fib6(int socket)
 {
 	struct ip6_lookup_fib_node_main *nm = &ip6_lookup_fib_nm;
-	struct rte_fib6_conf conf;
+	struct rte_fib6_conf conf = { 0 };
 	char s[RTE_FIB6_NAMESIZE];
 
 	/* One fib6 per socket */

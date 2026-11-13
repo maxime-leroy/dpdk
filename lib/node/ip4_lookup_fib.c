@@ -252,7 +252,7 @@ static int
 setup_fib(int socket)
 {
 	struct ip4_lookup_fib_node_main *nm = &ip4_lookup_fib_nm;
-	struct rte_fib_conf conf;
+	struct rte_fib_conf conf = { 0 };
 	char s[RTE_FIB_NAMESIZE];
 
 	/* One fib per socket */
