@@ -24,7 +24,7 @@
 static int
 setup_fib(int socket)
 {
-	struct rte_fib_conf conf;
+	struct rte_fib_conf conf = { 0 };
 
 #define FIB_MAX_ROUTES (UINT16_MAX)
 #define FIB_NUM_TBL8   (UINT16_MAX / 2)
@@ -41,7 +41,7 @@ setup_fib(int socket)
 static int
 setup_fib6(int socket)
 {
-	struct rte_fib6_conf conf;
+	struct rte_fib6_conf conf = { 0 };
 
 #define FIB6_MAX_ROUTES (UINT16_MAX)
 #define FIB6_NUM_TBL8   (UINT16_MAX / 2)
