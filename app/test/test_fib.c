@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include <rte_byteorder.h>
 #include <rte_ip.h>
 #include <rte_log.h>
 #include <rte_fib.h>
@@ -23,6 +24,8 @@ static int32_t test_add_del_invalid(void);
 static int32_t test_get_invalid(void);
 static int32_t test_lookup(void);
 static int32_t test_wraparound(void);
+static int32_t test_group_invalid(void);
+static int32_t test_group_lookup(void);
 static int32_t test_invalid_rcu(void);
 static int32_t test_fib_rcu_sync_rw(void);
 static int32_t test_tbl8_pool_grow(void);
@@ -473,6 +476,217 @@ test_wraparound(void)
 		"255.255.255.129: got nh %" PRIu64 ", want 6\n", nh[3]);
 
 	rte_fib_free(fib);
+	return TEST_SUCCESS;
+}
+
+/*
+ * Check that rte_fib_group_create fails gracefully for incorrect user input
+ * arguments, and that a group only accepts the FIBs matching it
+ */
+int32_t
+test_group_invalid(void)
+{
+	struct rte_fib_group_conf grp_conf = { 0 };
+	struct rte_fib_conf config = { 0 };
+	struct rte_fib_group *grp;
+	struct rte_fib *fib;
+	int ret;
+
+	grp = rte_fib_group_create(NULL);
+	RTE_TEST_ASSERT(grp == NULL,
+		"Call succeeded with invalid parameters\n");
+
+	grp_conf.type = RTE_FIB_DIR24_8 + 1;
+	grp = rte_fib_group_create(&grp_conf);
+	RTE_TEST_ASSERT(grp == NULL,
+		"Call succeeded with invalid parameters\n");
+	grp_conf.type = RTE_FIB_DIR24_8;
+
+	grp_conf.flags = RTE_FIB_ALLOWED_FLAGS + 1;
+	grp = rte_fib_group_create(&grp_conf);
+	RTE_TEST_ASSERT(grp == NULL,
+		"Call succeeded with invalid parameters\n");
+	grp_conf.flags = 0;
+
+	grp_conf.dir24_8.nh_sz = RTE_FIB_DIR24_8_8B + 1;
+	grp = rte_fib_group_create(&grp_conf);
+	RTE_TEST_ASSERT(grp == NULL,
+		"Call succeeded with invalid parameters\n");
+	grp_conf.dir24_8.nh_sz = RTE_FIB_DIR24_8_4B;
+
+	rte_fib_group_free(NULL);
+
+	ret = rte_fib_group_select_lookup(NULL, RTE_FIB_LOOKUP_DEFAULT);
+	RTE_TEST_ASSERT(ret == -EINVAL,
+		"Call succeeded with invalid parameters\n");
+
+	grp = rte_fib_group_create(&grp_conf);
+	RTE_TEST_ASSERT(grp != NULL, "Failed to create group\n");
+
+	config.max_routes = MAX_ROUTES;
+	config.default_nh = 100;
+	config.group = grp;
+
+	config.type = RTE_FIB_DUMMY;
+	fib = rte_fib_create(__func__, SOCKET_ID_ANY, &config);
+	RTE_TEST_ASSERT(fib == NULL,
+		"Call succeeded with a type not matching the group\n");
+	config.type = RTE_FIB_DIR24_8;
+	config.dir24_8.num_tbl8 = MAX_TBL8;
+
+	config.dir24_8.nh_sz = RTE_FIB_DIR24_8_8B;
+	fib = rte_fib_create(__func__, SOCKET_ID_ANY, &config);
+	RTE_TEST_ASSERT(fib == NULL,
+		"Call succeeded with a nexthop size not matching the group\n");
+	config.dir24_8.nh_sz = RTE_FIB_DIR24_8_4B;
+
+	config.flags = RTE_FIB_F_LOOKUP_NETWORK_ORDER;
+	fib = rte_fib_create(__func__, SOCKET_ID_ANY, &config);
+	RTE_TEST_ASSERT(fib == NULL,
+		"Call succeeded with flags not matching the group\n");
+	config.flags = 0;
+
+	fib = rte_fib_create(__func__, SOCKET_ID_ANY, &config);
+	RTE_TEST_ASSERT(fib != NULL, "Failed to create FIB\n");
+
+	rte_fib_free(fib);
+	rte_fib_group_free(grp);
+
+	return TEST_SUCCESS;
+}
+
+#define GROUP_NB_FIBS	2
+#define GROUP_NB_IPS	77
+
+static int
+group_lookup_and_check(struct rte_fib_group *grp, struct rte_fib **fibs,
+		       void **dps, uint32_t *ips)
+{
+	uint64_t nh_exp[GROUP_NB_IPS], nh[GROUP_NB_IPS];
+	uint32_t i;
+	int ret;
+
+	for (i = 0; i < GROUP_NB_IPS; i++) {
+		ret = rte_fib_lookup_bulk(fibs[i % GROUP_NB_FIBS], &ips[i],
+					  &nh_exp[i], 1);
+		RTE_TEST_ASSERT(ret == 0, "Failed to lookup\n");
+	}
+
+	ret = rte_fib_group_lookup_bulk(grp, dps, ips, nh, GROUP_NB_IPS);
+	RTE_TEST_ASSERT(ret == 0, "Failed to lookup in the group\n");
+
+	for (i = 0; i < GROUP_NB_IPS; i++)
+		RTE_TEST_ASSERT(nh[i] == nh_exp[i],
+			"Failed to get proper nexthop\n");
+
+	return TEST_SUCCESS;
+}
+
+/*
+ * Create FIBs of one group holding different routes, then check that one
+ * lookup over the group returns what a lookup in each of the FIBs does.
+ */
+static int
+check_group(struct rte_fib_conf *config)
+{
+	static const uint32_t probes[] = {
+		RTE_IPV4(10, 0, 0, 1), RTE_IPV4(10, 1, 0, 1),
+		RTE_IPV4(10, 2, 0, 1), RTE_IPV4(10, 1, 2, 1),
+		RTE_IPV4(10, 2, 2, 1), RTE_IPV4(10, 1, 2, 129),
+		RTE_IPV4(10, 2, 2, 200), RTE_IPV4(192, 0, 2, 1),
+		RTE_IPV4(192, 0, 2, 2), RTE_IPV4(255, 255, 255, 255),
+		RTE_IPV4(11, 0, 0, 1),
+	};
+	static const enum rte_fib_lookup_type types[] = {
+		RTE_FIB_LOOKUP_DIR24_8_SCALAR_MACRO,
+		RTE_FIB_LOOKUP_DIR24_8_VECTOR_AVX512,
+	};
+	struct rte_fib_group_conf grp_conf = { 0 };
+	struct rte_fib *fibs[GROUP_NB_FIBS];
+	char name[RTE_FIB_NAMESIZE];
+	uint32_t ips[GROUP_NB_IPS];
+	struct rte_fib_group *grp;
+	void *dps[GROUP_NB_IPS];
+	uint32_t i, f;
+	int ret;
+
+	grp_conf.type = config->type;
+	grp_conf.flags = config->flags;
+	grp_conf.dir24_8.nh_sz = config->dir24_8.nh_sz;
+	grp = rte_fib_group_create(&grp_conf);
+	RTE_TEST_ASSERT(grp != NULL, "Failed to create group\n");
+	config->group = grp;
+
+	for (f = 0; f < GROUP_NB_FIBS; f++) {
+		snprintf(name, sizeof(name), "%s_%u", __func__, f);
+		fibs[f] = rte_fib_create(name, SOCKET_ID_ANY, config);
+		RTE_TEST_ASSERT(fibs[f] != NULL, "Failed to create FIB\n");
+
+		ret = rte_fib_add(fibs[f], RTE_IPV4(10, 0, 0, 0), 8, 10 + f);
+		ret |= rte_fib_add(fibs[f], RTE_IPV4(10, f + 1, 0, 0), 16, 20 + f);
+		ret |= rte_fib_add(fibs[f], RTE_IPV4(10, f + 1, 2, 0), 24, 30 + f);
+		ret |= rte_fib_add(fibs[f], RTE_IPV4(10, f + 1, 2, 128), 25, 40 + f);
+		ret |= rte_fib_add(fibs[f], RTE_IPV4(192, 0, 2, f + 1), 32, 50 + f);
+		ret |= rte_fib_add(fibs[f], RTE_IPV4(255, 255, 255, 0), 24, 60 + f);
+		ret |= rte_fib_add(fibs[f], RTE_IPV4(255, 255, 255, 255), 32, 70 + f);
+		RTE_TEST_ASSERT(ret == 0, "Failed to add a route\n");
+	}
+
+	for (i = 0; i < GROUP_NB_IPS; i++) {
+		ips[i] = probes[i % RTE_DIM(probes)];
+		if (config->flags & RTE_FIB_F_LOOKUP_NETWORK_ORDER)
+			ips[i] = rte_cpu_to_be_32(ips[i]);
+		dps[i] = rte_fib_get_dp(fibs[i % GROUP_NB_FIBS]);
+	}
+
+	ret = group_lookup_and_check(grp, fibs, dps, ips);
+	RTE_TEST_ASSERT(ret == TEST_SUCCESS, "Lookup and check fails\n");
+
+	for (i = 0; i < RTE_DIM(types); i++) {
+		if (rte_fib_group_select_lookup(grp, types[i]) != 0)
+			continue;
+		ret = group_lookup_and_check(grp, fibs, dps, ips);
+		RTE_TEST_ASSERT(ret == TEST_SUCCESS, "Lookup and check fails\n");
+	}
+
+	rte_fib_group_free(grp);
+	for (f = 0; f < GROUP_NB_FIBS; f++)
+		rte_fib_free(fibs[f]);
+	config->group = NULL;
+
+	return TEST_SUCCESS;
+}
+
+int32_t
+test_group_lookup(void)
+{
+	struct rte_fib_conf config = { 0 };
+	unsigned int flags, nh_sz;
+	int ret;
+
+	config.max_routes = MAX_ROUTES;
+	config.rib_ext_sz = 0;
+	config.default_nh = 100;
+	config.type = RTE_FIB_DUMMY;
+
+	ret = check_group(&config);
+	RTE_TEST_ASSERT(ret == TEST_SUCCESS,
+		"Check_group fails for DUMMY type\n");
+
+	config.type = RTE_FIB_DIR24_8;
+	config.dir24_8.num_tbl8 = 127;
+
+	for (flags = 0; flags <= RTE_FIB_F_LOOKUP_NETWORK_ORDER; flags++) {
+		config.flags = flags;
+		for (nh_sz = RTE_FIB_DIR24_8_1B; nh_sz <= RTE_FIB_DIR24_8_8B; nh_sz++) {
+			config.dir24_8.nh_sz = nh_sz;
+			ret = check_group(&config);
+			RTE_TEST_ASSERT(ret == TEST_SUCCESS,
+				"Check_group fails for DIR24_8 nh_sz %u flags %u\n",
+				nh_sz, flags);
+		}
+	}
+
 	return TEST_SUCCESS;
 }
 
@@ -1036,6 +1250,8 @@ static struct unit_test_suite fib_fast_tests = {
 	TEST_CASE(test_get_invalid),
 	TEST_CASE(test_lookup),
 	TEST_CASE(test_wraparound),
+	TEST_CASE(test_group_invalid),
+	TEST_CASE(test_group_lookup),
 	TEST_CASE(test_invalid_rcu),
 	TEST_CASE(test_fib_rcu_sync_rw),
 	TEST_CASE(test_tbl8_pool_grow),

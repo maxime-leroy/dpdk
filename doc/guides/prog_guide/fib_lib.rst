@@ -45,6 +45,12 @@ The main methods within the ``rte_fib`` API are:
 * ``rte_fib_lookup_bulk()``: Provides a bulk Longest Prefix Match (LPM) lookup function
   for a set of IP addresses, it will return a set of corresponding next hop IDs.
 
+* ``rte_fib_group_lookup_bulk()``: Same as ``rte_fib_lookup_bulk()``,
+  with every IP address looked up in its own FIB, given by its ``rte_fib_get_dp()`` pointer.
+  These FIBs must belong to the same group, created with ``rte_fib_group_create()``
+  and passed in the ``group`` field of their configuration.
+  A group only accepts FIBs of its own type, flags and next hop size.
+
 
 Implementation details
 ----------------------

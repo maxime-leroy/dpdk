@@ -46,6 +46,15 @@ struct rte_fib {
 	rte_fib_lookup_fn_t	lookup;	/**< FIB lookup function */
 	rte_fib_modify_fn_t	modify; /**< modify FIB datastructure */
 	uint64_t		def_nh;
+	struct rte_fib_group	*group;	/**< group the FIB belongs to */
+};
+
+struct rte_fib_group {
+	fib_lookup_multi_fn_t	lookup;	/**< lookup, one FIB per IP */
+	enum rte_fib_type	type;	/**< Type of the FIBs */
+	unsigned int		flags;	/**< Flags of the FIBs */
+	enum rte_fib_dir24_8_nh_sz nh_sz; /**< Size of nexthop entry */
+	uint32_t		refcnt;
 };
 
 static void
@@ -63,6 +72,16 @@ dummy_lookup(void *fib_p, const uint32_t *ips, uint64_t *next_hops,
 		else
 			next_hops[i] = fib->def_nh;
 	}
+}
+
+static void
+dummy_lookup_multi(void * const *dps, const uint32_t *ips, uint64_t *next_hops,
+		   const unsigned int n)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++)
+		dummy_lookup(dps[i], &ips[i], &next_hops[i], 1);
 }
 
 static int
@@ -150,6 +169,97 @@ rte_fib_lookup_bulk(struct rte_fib *fib, uint32_t *ips,
 	return 0;
 }
 
+static fib_lookup_multi_fn_t
+fib_group_get_lookup_fn(const struct rte_fib_group *grp, enum rte_fib_lookup_type type)
+{
+	switch (grp->type) {
+	case RTE_FIB_DUMMY:
+		return type == RTE_FIB_LOOKUP_DEFAULT ? dummy_lookup_multi : NULL;
+	case RTE_FIB_DIR24_8:
+		return dir24_8_get_lookup_multi_fn(grp->nh_sz, type,
+			!!(grp->flags & RTE_FIB_F_LOOKUP_NETWORK_ORDER));
+	default:
+		return NULL;
+	}
+}
+
+static void
+fib_group_unref(struct rte_fib_group *grp)
+{
+	if (--grp->refcnt == 0)
+		rte_free(grp);
+}
+
+RTE_EXPORT_EXPERIMENTAL_SYMBOL(rte_fib_group_create, 27.03)
+struct rte_fib_group *
+rte_fib_group_create(const struct rte_fib_group_conf *conf)
+{
+	struct rte_fib_group *grp;
+
+	if ((conf == NULL) || (conf->type > RTE_FIB_DIR24_8) ||
+			(conf->flags & ~RTE_FIB_ALLOWED_FLAGS) ||
+			((conf->type == RTE_FIB_DIR24_8) &&
+			((conf->dir24_8.nh_sz < RTE_FIB_DIR24_8_1B) ||
+			(conf->dir24_8.nh_sz > RTE_FIB_DIR24_8_8B)))) {
+		rte_errno = EINVAL;
+		return NULL;
+	}
+
+	grp = rte_zmalloc("FIB_GROUP", sizeof(*grp), RTE_CACHE_LINE_SIZE);
+	if (grp == NULL) {
+		rte_errno = ENOMEM;
+		return NULL;
+	}
+
+	grp->type = conf->type;
+	grp->flags = conf->flags;
+	if (conf->type == RTE_FIB_DIR24_8)
+		grp->nh_sz = conf->dir24_8.nh_sz;
+	grp->refcnt = 1;
+	grp->lookup = fib_group_get_lookup_fn(grp, RTE_FIB_LOOKUP_DEFAULT);
+
+	return grp;
+}
+
+RTE_EXPORT_EXPERIMENTAL_SYMBOL(rte_fib_group_free, 27.03)
+void
+rte_fib_group_free(struct rte_fib_group *grp)
+{
+	if (grp == NULL)
+		return;
+
+	fib_group_unref(grp);
+}
+
+RTE_EXPORT_EXPERIMENTAL_SYMBOL(rte_fib_group_lookup_bulk, 27.03)
+int
+rte_fib_group_lookup_bulk(struct rte_fib_group *grp, void * const *dps,
+			  const uint32_t *ips, uint64_t *next_hops, int n)
+{
+	FIB_RETURN_IF_TRUE(((grp == NULL) || (dps == NULL) || (ips == NULL) ||
+		(next_hops == NULL) || (grp->lookup == NULL)), -EINVAL);
+
+	grp->lookup(dps, ips, next_hops, n);
+	return 0;
+}
+
+RTE_EXPORT_EXPERIMENTAL_SYMBOL(rte_fib_group_select_lookup, 27.03)
+int
+rte_fib_group_select_lookup(struct rte_fib_group *grp, enum rte_fib_lookup_type type)
+{
+	fib_lookup_multi_fn_t fn;
+
+	if (grp == NULL)
+		return -EINVAL;
+
+	fn = fib_group_get_lookup_fn(grp, type);
+	if (fn == NULL)
+		return -EINVAL;
+
+	grp->lookup = fn;
+	return 0;
+}
+
 RTE_EXPORT_SYMBOL(rte_fib_create)
 struct rte_fib *
 rte_fib_create(const char *name, int socket_id, struct rte_fib_conf *conf)
@@ -166,6 +276,14 @@ rte_fib_create(const char *name, int socket_id, struct rte_fib_conf *conf)
 	if ((name == NULL) || (conf == NULL) ||	(conf->max_routes < 0) ||
 			(conf->flags & ~RTE_FIB_ALLOWED_FLAGS) ||
 			(conf->type > RTE_FIB_DIR24_8)) {
+		rte_errno = EINVAL;
+		return NULL;
+	}
+
+	if ((conf->group != NULL) && ((conf->type != conf->group->type) ||
+			(conf->flags != conf->group->flags) ||
+			((conf->type == RTE_FIB_DIR24_8) &&
+			(conf->dir24_8.nh_sz != conf->group->nh_sz)))) {
 		rte_errno = EINVAL;
 		return NULL;
 	}
@@ -227,6 +345,11 @@ rte_fib_create(const char *name, int socket_id, struct rte_fib_conf *conf)
 			"with err %d", name, ret);
 		rte_errno = -ret;
 		goto free_fib;
+	}
+
+	if (conf->group != NULL) {
+		fib->group = conf->group;
+		fib->group->refcnt++;
 	}
 
 	te->data = (void *)fib;
@@ -312,6 +435,8 @@ rte_fib_free(struct rte_fib *fib)
 
 	free_dataplane(fib);
 	rte_rib_free(fib->rib);
+	if (fib->group != NULL)
+		fib_group_unref(fib->group);
 	rte_free(fib);
 	rte_free(te);
 }

@@ -2,6 +2,8 @@
  * Copyright(c) 2020 Intel Corporation
  */
 
+#include <stddef.h>
+
 #include <rte_vect.h>
 #include <rte_fib.h>
 
@@ -169,3 +171,83 @@ rte_dir24_8_vec_lookup_bulk_8b_be(void *p, const uint32_t *ips,
 		dir24_8_vec_lookup_x8_8b(p, ips + i * 8, next_hops + i * 8, true);
 	dir24_8_lookup_bulk_8b_be(p, ips + i * 8, next_hops + i * 8, n - i * 8);
 }
+
+static inline void
+dir24_8_vec_lookup_multi_x8(void * const *dps, const uint32_t *ips,
+			    uint64_t *next_hops, uint8_t nh_sz)
+{
+	const __m512i tbl24_off = _mm512_set1_epi64(offsetof(struct dir24_8_tbl, tbl24));
+	const __m512i tbl8_off = _mm512_set1_epi64(offsetof(struct dir24_8_tbl, tbl8));
+	const __m512i res_msk = _mm512_set1_epi64(lookup_msk(nh_sz));
+	const __m512i lsbyte_msk = _mm512_set1_epi64(0xff);
+	const __m512i zero = _mm512_setzero_si512();
+	const __m512i lsb = _mm512_set1_epi64(1);
+	__m512i dp_vec, res, idxes, bytes, tbl8s;
+	__mmask8 msk_ext;
+	__m256i ip_vec;
+
+	ip_vec = _mm256_loadu_si256((const void *)ips);
+	dp_vec = _mm512_loadu_si512((const void *)dps);
+
+	/* addresses of the tbl24 entries */
+	idxes = _mm512_cvtepu32_epi64(_mm256_srli_epi32(ip_vec, 8));
+	idxes = _mm512_slli_epi64(idxes, nh_sz);
+	idxes = _mm512_add_epi64(idxes, _mm512_add_epi64(dp_vec, tbl24_off));
+
+	if (nh_sz == RTE_FIB_DIR24_8_8B) {
+		res = _mm512_i64gather_epi64(idxes, NULL, 1);
+	} else {
+		res = _mm512_cvtepu32_epi64(_mm512_i64gather_epi32(idxes, NULL, 1));
+		res = _mm512_and_epi64(res, res_msk);
+	}
+
+	/* get extended entries indexes */
+	msk_ext = _mm512_test_epi64_mask(res, lsb);
+
+	if (msk_ext != 0) {
+		tbl8s = _mm512_mask_i64gather_epi64(zero, msk_ext,
+						    _mm512_add_epi64(dp_vec, tbl8_off), NULL, 1);
+		bytes = _mm512_and_epi64(_mm512_cvtepu32_epi64(ip_vec), lsbyte_msk);
+		idxes = _mm512_srli_epi64(res, 1);
+		idxes = _mm512_slli_epi64(idxes, 8);
+		idxes = _mm512_add_epi64(idxes, bytes);
+		idxes = _mm512_add_epi64(tbl8s, _mm512_slli_epi64(idxes, nh_sz));
+
+		if (nh_sz == RTE_FIB_DIR24_8_8B) {
+			idxes = _mm512_mask_i64gather_epi64(zero, msk_ext, idxes, NULL, 1);
+		} else {
+			idxes = _mm512_cvtepu32_epi64(_mm512_mask_i64gather_epi32(
+				_mm256_setzero_si256(), msk_ext, idxes, NULL, 1));
+			idxes = _mm512_and_epi64(idxes, res_msk);
+		}
+
+		res = _mm512_mask_blend_epi64(msk_ext, res, idxes);
+	}
+
+	res = _mm512_srli_epi64(res, 1);
+	_mm512_storeu_si512(next_hops, res);
+}
+
+#define DECLARE_VECTOR_MULTI_FN(suffix, nh_sz) \
+void \
+rte_dir24_8_vec_lookup_bulk_multi_##suffix(void * const *dps, const uint32_t *ips, \
+					   uint64_t *next_hops, const unsigned int n) \
+{ \
+	uint32_t i; \
+	for (i = 0; i < (n / 8); i++) \
+		dir24_8_vec_lookup_multi_x8(dps + i * 8, ips + i * 8, next_hops + i * 8, nh_sz); \
+	dir24_8_lookup_bulk_multi_##suffix(dps + i * 8, ips + i * 8, next_hops + i * 8, \
+					   n - i * 8); \
+} \
+void \
+rte_dir24_8_vec_lookup_bulk_multi_##suffix##_be(void * const *dps, const uint32_t *ips, \
+						uint64_t *next_hops, const unsigned int n) \
+{ \
+	dir24_8_lookup_bulk_multi_be(dps, ips, next_hops, n, \
+				     rte_dir24_8_vec_lookup_bulk_multi_##suffix); \
+}
+
+DECLARE_VECTOR_MULTI_FN(1b, RTE_FIB_DIR24_8_1B)
+DECLARE_VECTOR_MULTI_FN(2b, RTE_FIB_DIR24_8_2B)
+DECLARE_VECTOR_MULTI_FN(4b, RTE_FIB_DIR24_8_4B)
+DECLARE_VECTOR_MULTI_FN(8b, RTE_FIB_DIR24_8_8B)

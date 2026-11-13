@@ -26,6 +26,7 @@ extern "C" {
 #endif
 
 struct rte_fib;
+struct rte_fib_group;
 struct rte_rib;
 
 /* Maximum length of a FIB name. */
@@ -113,6 +114,19 @@ struct rte_fib_conf {
 		} dir24_8;
 	};
 	unsigned int flags; /**< Optional feature flags from RTE_FIB_F_* */
+	/** Group the FIB belongs to (NULL = no group) */
+	struct rte_fib_group *group;
+};
+
+/** FIB group configuration structure */
+struct rte_fib_group_conf {
+	enum rte_fib_type type; /**< Type of the FIBs of the group */
+	unsigned int flags; /**< RTE_FIB_F_* flags of the FIBs of the group */
+	union {
+		struct {
+			enum rte_fib_dir24_8_nh_sz nh_sz;
+		} dir24_8;
+	};
 };
 
 /** FIB RCU QSBR configuration structure. */
@@ -227,6 +241,80 @@ rte_fib_delete(struct rte_fib *fib, uint32_t ip, uint8_t depth);
 int
 rte_fib_lookup_bulk(struct rte_fib *fib, uint32_t *ips,
 		uint64_t *next_hops, int n);
+
+/**
+ * Create a group of FIBs
+ *
+ * A group gathers FIBs of the same type, flags and next hop size, so that
+ * IP addresses belonging to different FIBs can be looked up in one call.
+ * A FIB joins a group on creation, through the group field of rte_fib_conf.
+ *
+ * Creating and freeing a group and its FIBs must be serialized by the caller.
+ *
+ * @param conf
+ *   Group configuration
+ * @return
+ *   Handle to the group on success
+ *   NULL otherwise with rte_errno set to an appropriate values.
+ */
+__rte_experimental
+struct rte_fib_group *
+rte_fib_group_create(const struct rte_fib_group_conf *conf);
+
+/**
+ * Release a group of FIBs
+ *
+ * The group is freed once all its FIBs have been freed.
+ *
+ * @param grp
+ *   Group handle (NULL is allowed)
+ */
+__rte_experimental
+void
+rte_fib_group_free(struct rte_fib_group *grp);
+
+/**
+ * Lookup multiple IP addresses, each in its own FIB of a group
+ *
+ * @param grp
+ *   Group handle
+ * @param dps
+ *   Array of dataplane struct pointers returned by rte_fib_get_dp(),
+ *   one per IP: ips[i] is looked up in the FIB owning dps[i].
+ *   All these FIBs must belong to grp.
+ * @param ips
+ *   Array of IPs to be looked up in the FIBs
+ * @param next_hops
+ *   Next hop of the most specific rule found for IP.
+ *   This is an array of eight byte values.
+ *   If the lookup for the given IP failed, then corresponding element would
+ *   contain default nexthop value configured for its FIB.
+ * @param n
+ *   Number of elements in dps, ips (and next_hops) arrays to lookup.
+ * @return
+ *   -EINVAL for incorrect arguments, otherwise 0
+ */
+__rte_experimental
+int
+rte_fib_group_lookup_bulk(struct rte_fib_group *grp, void * const *dps,
+			  const uint32_t *ips, uint64_t *next_hops, int n);
+
+/**
+ * Set lookup function of a group based on type
+ *
+ * @param grp
+ *   Group handle
+ * @param type
+ *   Lookup function implementation to use
+ *
+ * @return
+ *   0 on success
+ *   -EINVAL on failure
+ */
+__rte_experimental
+int
+rte_fib_group_select_lookup(struct rte_fib_group *grp, enum rte_fib_lookup_type type);
+
 /**
  * Get pointer to the dataplane specific struct
  *

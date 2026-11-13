@@ -21,6 +21,9 @@
  * DIR24_8 algorithm
  */
 
+typedef void (*fib_lookup_multi_fn_t)(void * const *dps, const uint32_t *ips,
+				      uint64_t *next_hops, const unsigned int n);
+
 #define DIR24_8_TBL24_NUM_ENT		(1 << 24)
 #define DIR24_8_EXT_ENT			1
 #define DIR24_8_TBL24_MASK		0xffffff00
@@ -282,6 +285,62 @@ DECLARE_BE_LOOKUP_FN(dir24_8_lookup_bulk_2)
 DECLARE_BE_LOOKUP_FN(dir24_8_lookup_bulk_3)
 DECLARE_BE_LOOKUP_FN(dir24_8_lookup_bulk_uni)
 
+#define LOOKUP_MULTI_FUNC(suffix, type)					\
+static inline void							\
+dir24_8_lookup_bulk_multi_##suffix(void * const *dps, const uint32_t *ips, \
+				   uint64_t *next_hops, const unsigned int n) \
+{									\
+	const struct dir24_8_tbl *dp;					\
+	uint64_t tmp;							\
+	uint32_t i;							\
+									\
+	for (i = 0; i < n; i++) {					\
+		dp = dps[i];						\
+		tmp = ((const type *)dp->tbl24)[ips[i] >> 8];		\
+		if (unlikely(is_entry_extended(tmp)))			\
+			tmp = ((const type *)dp->tbl8)[(uint8_t)ips[i] + \
+				((tmp >> 1) * FIB_TBL8_GRP_NUM_ENT)];	\
+		next_hops[i] = tmp >> 1;				\
+	}								\
+}
+
+LOOKUP_MULTI_FUNC(1b, uint8_t)
+LOOKUP_MULTI_FUNC(2b, uint16_t)
+LOOKUP_MULTI_FUNC(4b, uint32_t)
+LOOKUP_MULTI_FUNC(8b, uint64_t)
+
+static inline void
+dir24_8_lookup_bulk_multi_be(void * const *dps, const uint32_t *ips, uint64_t *next_hops,
+			     const unsigned int n, fib_lookup_multi_fn_t cb)
+{
+	uint32_t le_ips[BSWAP_MAX_LENGTH];
+	unsigned int i;
+
+#if RTE_BYTE_ORDER == RTE_BIG_ENDIAN
+	cb(dps, ips, next_hops, n);
+#else
+	for (i = 0; i < n; i += BSWAP_MAX_LENGTH) {
+		int j;
+		for (j = 0; j < BSWAP_MAX_LENGTH && i + j < n; j++)
+			le_ips[j] = rte_be_to_cpu_32(ips[i + j]);
+
+		cb(dps + i, le_ips, next_hops + i, j);
+	}
+#endif
+}
+
+#define DECLARE_BE_LOOKUP_MULTI_FN(name) \
+static inline void \
+name##_be(void * const *dps, const uint32_t *ips, uint64_t *next_hops, const unsigned int n) \
+{ \
+	dir24_8_lookup_bulk_multi_be(dps, ips, next_hops, n, name); \
+}
+
+DECLARE_BE_LOOKUP_MULTI_FN(dir24_8_lookup_bulk_multi_1b)
+DECLARE_BE_LOOKUP_MULTI_FN(dir24_8_lookup_bulk_multi_2b)
+DECLARE_BE_LOOKUP_MULTI_FN(dir24_8_lookup_bulk_multi_4b)
+DECLARE_BE_LOOKUP_MULTI_FN(dir24_8_lookup_bulk_multi_8b)
+
 void *
 dir24_8_create(const char *name, int socket_id, struct rte_fib_conf *conf);
 
@@ -290,6 +349,10 @@ dir24_8_free(void *p);
 
 rte_fib_lookup_fn_t
 dir24_8_get_lookup_fn(void *p, enum rte_fib_lookup_type type, bool be_addr);
+
+fib_lookup_multi_fn_t
+dir24_8_get_lookup_multi_fn(enum rte_fib_dir24_8_nh_sz nh_sz, enum rte_fib_lookup_type type,
+			    bool be_addr);
 
 int
 dir24_8_modify(struct rte_fib *fib, uint32_t ip, uint8_t depth,

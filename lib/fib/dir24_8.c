@@ -152,6 +152,76 @@ dir24_8_get_lookup_fn(void *p, enum rte_fib_lookup_type type, bool be_addr)
 	return NULL;
 }
 
+static inline fib_lookup_multi_fn_t
+get_scalar_multi_fn(enum rte_fib_dir24_8_nh_sz nh_sz, bool be_addr)
+{
+	switch (nh_sz) {
+	case RTE_FIB_DIR24_8_1B:
+		return be_addr ? dir24_8_lookup_bulk_multi_1b_be : dir24_8_lookup_bulk_multi_1b;
+	case RTE_FIB_DIR24_8_2B:
+		return be_addr ? dir24_8_lookup_bulk_multi_2b_be : dir24_8_lookup_bulk_multi_2b;
+	case RTE_FIB_DIR24_8_4B:
+		return be_addr ? dir24_8_lookup_bulk_multi_4b_be : dir24_8_lookup_bulk_multi_4b;
+	case RTE_FIB_DIR24_8_8B:
+		return be_addr ? dir24_8_lookup_bulk_multi_8b_be : dir24_8_lookup_bulk_multi_8b;
+	default:
+		return NULL;
+	}
+}
+
+static inline fib_lookup_multi_fn_t
+get_vector_multi_fn(enum rte_fib_dir24_8_nh_sz nh_sz, bool be_addr)
+{
+#ifdef CC_AVX512_SUPPORT
+	if (rte_cpu_get_flag_enabled(RTE_CPUFLAG_AVX512F) <= 0 ||
+			rte_cpu_get_flag_enabled(RTE_CPUFLAG_AVX512DQ) <= 0 ||
+			rte_vect_get_max_simd_bitwidth() < RTE_VECT_SIMD_512)
+		return NULL;
+
+	switch (nh_sz) {
+	case RTE_FIB_DIR24_8_1B:
+		return be_addr ? rte_dir24_8_vec_lookup_bulk_multi_1b_be :
+			rte_dir24_8_vec_lookup_bulk_multi_1b;
+	case RTE_FIB_DIR24_8_2B:
+		return be_addr ? rte_dir24_8_vec_lookup_bulk_multi_2b_be :
+			rte_dir24_8_vec_lookup_bulk_multi_2b;
+	case RTE_FIB_DIR24_8_4B:
+		return be_addr ? rte_dir24_8_vec_lookup_bulk_multi_4b_be :
+			rte_dir24_8_vec_lookup_bulk_multi_4b;
+	case RTE_FIB_DIR24_8_8B:
+		return be_addr ? rte_dir24_8_vec_lookup_bulk_multi_8b_be :
+			rte_dir24_8_vec_lookup_bulk_multi_8b;
+	default:
+		return NULL;
+	}
+#else
+	RTE_SET_USED(nh_sz);
+	RTE_SET_USED(be_addr);
+#endif
+	return NULL;
+}
+
+fib_lookup_multi_fn_t
+dir24_8_get_lookup_multi_fn(enum rte_fib_dir24_8_nh_sz nh_sz, enum rte_fib_lookup_type type,
+			    bool be_addr)
+{
+	fib_lookup_multi_fn_t ret_fn;
+
+	switch (type) {
+	case RTE_FIB_LOOKUP_DIR24_8_SCALAR_MACRO:
+	case RTE_FIB_LOOKUP_DIR24_8_SCALAR_INLINE:
+	case RTE_FIB_LOOKUP_DIR24_8_SCALAR_UNI:
+		return get_scalar_multi_fn(nh_sz, be_addr);
+	case RTE_FIB_LOOKUP_DIR24_8_VECTOR_AVX512:
+		return get_vector_multi_fn(nh_sz, be_addr);
+	case RTE_FIB_LOOKUP_DEFAULT:
+		ret_fn = get_vector_multi_fn(nh_sz, be_addr);
+		return ret_fn != NULL ? ret_fn : get_scalar_multi_fn(nh_sz, be_addr);
+	default:
+		return NULL;
+	}
+}
+
 static int
 tbl8_alloc(struct dir24_8_tbl *dp, uint64_t nh)
 {
