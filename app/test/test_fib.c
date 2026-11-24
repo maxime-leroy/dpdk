@@ -27,6 +27,8 @@ static int32_t test_invalid_rcu(void);
 static int32_t test_fib_rcu_sync_rw(void);
 static int32_t test_tbl8_pool_grow(void);
 static int32_t test_tbl8_pool_grow_late(void);
+static int32_t test_tbl8_pool_shared(void);
+static int32_t test_tbl8_pool_shared_dq(void);
 
 #define MAX_ROUTES	(1 << 16)
 #define MAX_TBL8	(1 << 15)
@@ -862,6 +864,167 @@ test_tbl8_pool_grow_late(void)
 	return TEST_SUCCESS;
 }
 
+/*
+ * Two FIBs share a fixed pool of two tbl8 groups. The group reserved by
+ * a route of one FIB can not be taken by the other, it is there when its
+ * owner needs it, and it returns to the pool when the FIB is freed.
+ */
+static int32_t
+test_tbl8_pool_shared(void)
+{
+	struct rte_fib_tbl8_pool_conf pool_conf = {
+		.num_tbl8 = 2,
+		.nh_sz = RTE_FIB_DIR24_8_2B,
+		.socket_id = SOCKET_ID_ANY,
+	};
+	struct rte_fib_conf config = { 0 };
+	struct rte_fib_tbl8_pool *pool;
+	struct rte_fib *fib_a, *fib_b;
+	uint32_t used;
+	uint32_t ip;
+	uint64_t nh;
+	int ret;
+
+	config.max_routes = 16;
+	config.default_nh = 0;
+	config.type = RTE_FIB_DIR24_8;
+	config.dir24_8.nh_sz = RTE_FIB_DIR24_8_2B;
+
+	pool = rte_fib_tbl8_pool_create("shared4", &pool_conf);
+	RTE_TEST_ASSERT(pool != NULL, "Failed to create pool\n");
+	config.dir24_8.tbl8_pool = pool;
+	fib_a = rte_fib_create("shared4_a", SOCKET_ID_ANY, &config);
+	RTE_TEST_ASSERT(fib_a != NULL, "Failed to create FIB A\n");
+	fib_b = rte_fib_create("shared4_b", SOCKET_ID_ANY, &config);
+	RTE_TEST_ASSERT(fib_b != NULL, "Failed to create FIB B\n");
+
+	/* A reserves a group for a /32 hidden by its /8 */
+	ret = rte_fib_add(fib_a, RTE_IPV4(10, 0, 0, 0), 8, 5);
+	ret |= rte_fib_add(fib_a, RTE_IPV4(10, 0, 1, 1), 32, 5);
+	RTE_TEST_ASSERT(ret == 0, "Failed to add the routes of A\n");
+
+	/* B gets the unreserved group, not a second one */
+	ret = rte_fib_add(fib_b, RTE_IPV4(10, 0, 2, 1), 32, 7);
+	RTE_TEST_ASSERT(ret == 0, "ADD in B failed (ret=%d)\n", ret);
+	ret = rte_fib_add(fib_b, RTE_IPV4(10, 0, 3, 1), 32, 8);
+	RTE_TEST_ASSERT(ret == -ENOSPC,
+		"ADD in B must not take the group reserved by A (ret=%d)\n",
+		ret);
+	rte_fib_tbl8_pool_get_stats(pool, &used, NULL, NULL);
+	RTE_TEST_ASSERT(used == 1, "expected 1 group taken, got %u\n", used);
+
+	/* the /32 of A needs its group once the /8 changes */
+	ret = rte_fib_add(fib_a, RTE_IPV4(10, 0, 0, 0), 8, 6);
+	RTE_TEST_ASSERT(ret == 0,
+		"next hop update in A failed (ret=%d)\n", ret);
+	rte_fib_tbl8_pool_get_stats(pool, &used, NULL, NULL);
+	RTE_TEST_ASSERT(used == 2, "expected 2 groups taken, got %u\n", used);
+	ip = RTE_IPV4(10, 0, 1, 1);
+	rte_fib_lookup_bulk(fib_a, &ip, &nh, 1);
+	RTE_TEST_ASSERT(nh == 5, "/32 of A: got nh %" PRIu64 ", want 5\n", nh);
+	ip = RTE_IPV4(10, 0, 1, 2);
+	rte_fib_lookup_bulk(fib_a, &ip, &nh, 1);
+	RTE_TEST_ASSERT(nh == 6, "/8 of A: got nh %" PRIu64 ", want 6\n", nh);
+
+	/* freeing A, which still holds its routes, returns its group */
+	rte_fib_free(fib_a);
+	rte_fib_tbl8_pool_get_stats(pool, &used, NULL, NULL);
+	RTE_TEST_ASSERT(used == 1, "expected 1 group taken, got %u\n", used);
+	ret = rte_fib_add(fib_b, RTE_IPV4(10, 0, 3, 1), 32, 8);
+	RTE_TEST_ASSERT(ret == 0, "ADD in B failed (ret=%d)\n", ret);
+	ip = RTE_IPV4(10, 0, 2, 1);
+	rte_fib_lookup_bulk(fib_b, &ip, &nh, 1);
+	RTE_TEST_ASSERT(nh == 7, "first /32 of B: got nh %" PRIu64 "\n", nh);
+	ip = RTE_IPV4(10, 0, 3, 1);
+	rte_fib_lookup_bulk(fib_b, &ip, &nh, 1);
+	RTE_TEST_ASSERT(nh == 8, "second /32 of B: got nh %" PRIu64 "\n", nh);
+
+	rte_fib_free(fib_b);
+	rte_fib_tbl8_pool_get_stats(pool, &used, NULL, NULL);
+	RTE_TEST_ASSERT(used == 0, "expected an empty pool, got %u\n", used);
+	rte_fib_tbl8_pool_free(pool);
+	return TEST_SUCCESS;
+}
+
+/*
+ * Two FIBs share a fixed pool of one tbl8 group, with an RCU defer queue
+ * each. A group released by one FIB waits in the defer queue of that FIB.
+ * Once the readers are quiescent, the other FIB must be able to get it.
+ */
+static int32_t
+test_tbl8_pool_shared_dq(void)
+{
+	struct rte_fib_tbl8_pool_conf pool_conf = {
+		.num_tbl8 = 1,
+		.nh_sz = RTE_FIB_DIR24_8_2B,
+		.socket_id = SOCKET_ID_ANY,
+	};
+	struct rte_fib_rcu_config rcu_cfg = { 0 };
+	struct rte_fib_conf config = { 0 };
+	struct rte_fib_tbl8_pool *pool;
+	struct rte_fib *fib_a, *fib_b;
+	struct rte_rcu_qsbr *qsv;
+	uint32_t used;
+	uint32_t ip;
+	uint64_t nh;
+	size_t sz;
+	int ret;
+
+	config.max_routes = 16;
+	config.default_nh = 0;
+	config.type = RTE_FIB_DIR24_8;
+	config.dir24_8.nh_sz = RTE_FIB_DIR24_8_2B;
+
+	pool = rte_fib_tbl8_pool_create("shdq4", &pool_conf);
+	RTE_TEST_ASSERT(pool != NULL, "Failed to create pool\n");
+	config.dir24_8.tbl8_pool = pool;
+	fib_a = rte_fib_create("shdq4_a", SOCKET_ID_ANY, &config);
+	RTE_TEST_ASSERT(fib_a != NULL, "Failed to create FIB A\n");
+	fib_b = rte_fib_create("shdq4_b", SOCKET_ID_ANY, &config);
+	RTE_TEST_ASSERT(fib_b != NULL, "Failed to create FIB B\n");
+
+	sz = rte_rcu_qsbr_get_memsize(1);
+	qsv = rte_zmalloc_socket(NULL, sz, RTE_CACHE_LINE_SIZE, SOCKET_ID_ANY);
+	RTE_TEST_ASSERT(qsv != NULL, "Can not allocate memory for RCU\n");
+	ret = rte_rcu_qsbr_init(qsv, 1);
+	RTE_TEST_ASSERT(ret == 0, "Can not initialize RCU\n");
+	rcu_cfg.v = qsv;
+	rcu_cfg.mode = RTE_FIB_QSBR_MODE_DQ;
+	ret = rte_fib_rcu_qsbr_add(fib_a, &rcu_cfg);
+	ret |= rte_fib_rcu_qsbr_add(fib_b, &rcu_cfg);
+	RTE_TEST_ASSERT(ret == 0, "Can not add RCU to the FIBs\n");
+
+	rte_rcu_qsbr_thread_register(qsv, 0);
+	rte_rcu_qsbr_thread_online(qsv, 0);
+
+	/* the group released by B waits for the reader in the queue of B */
+	ret = rte_fib_add(fib_b, RTE_IPV4(10, 0, 1, 1), 32, 7);
+	ret |= rte_fib_delete(fib_b, RTE_IPV4(10, 0, 1, 1), 32);
+	RTE_TEST_ASSERT(ret == 0, "ADD then DEL in B failed\n");
+	rte_fib_tbl8_pool_get_stats(pool, &used, NULL, NULL);
+	RTE_TEST_ASSERT(used == 1, "expected 1 group taken, got %u\n", used);
+
+	/* the reader is quiescent: A gets the group without any help of B */
+	rte_rcu_qsbr_quiescent(qsv, 0);
+	ret = rte_fib_add(fib_a, RTE_IPV4(10, 0, 2, 1), 32, 8);
+	RTE_TEST_ASSERT(ret == 0,
+		"ADD in A can not get the group released by B (ret=%d)\n",
+		ret);
+	ip = RTE_IPV4(10, 0, 2, 1);
+	rte_fib_lookup_bulk(fib_a, &ip, &nh, 1);
+	RTE_TEST_ASSERT(nh == 8, "/32 of A: got nh %" PRIu64 ", want 8\n", nh);
+
+	rte_rcu_qsbr_thread_offline(qsv, 0);
+	rte_rcu_qsbr_thread_unregister(qsv, 0);
+	rte_fib_free(fib_a);
+	rte_fib_free(fib_b);
+	rte_fib_tbl8_pool_get_stats(pool, &used, NULL, NULL);
+	RTE_TEST_ASSERT(used == 0, "expected an empty pool, got %u\n", used);
+	rte_fib_tbl8_pool_free(pool);
+	rte_free(qsv);
+	return TEST_SUCCESS;
+}
+
 static struct unit_test_suite fib_fast_tests = {
 	.suite_name = "fib autotest",
 	.setup = NULL,
@@ -877,6 +1040,8 @@ static struct unit_test_suite fib_fast_tests = {
 	TEST_CASE(test_fib_rcu_sync_rw),
 	TEST_CASE(test_tbl8_pool_grow),
 	TEST_CASE(test_tbl8_pool_grow_late),
+	TEST_CASE(test_tbl8_pool_shared),
+	TEST_CASE(test_tbl8_pool_shared_dq),
 	TEST_CASES_END()
 	}
 };
