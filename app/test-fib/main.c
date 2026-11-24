@@ -82,6 +82,7 @@ static struct {
 	uint32_t	nb_routes_per_depth[128 + 1];
 	uint32_t	flags;
 	uint32_t	tbl8;
+	uint32_t	nb_fibs;
 	uint8_t		ent_sz;
 	uint8_t		rnd_lookup_ips_ratio;
 	uint8_t		print_fract;
@@ -95,6 +96,7 @@ static struct {
 	.nb_routes_per_depth = {0},
 	.flags = FIB_V4_DIR_TYPE,
 	.tbl8 = DEFAULT_LPM_TBL8,
+	.nb_fibs = 1,
 	.ent_sz = 4,
 	.rnd_lookup_ips_ratio = 0,
 	.print_fract = 10,
@@ -624,6 +626,8 @@ print_usage(void)
 		"[-e <entry size (valid only for dir and trie fib types): "
 		"1/2/4/8 (default 4)>]\n"
 		"[-g <number of tbl8's for dir24_8 or trie FIBs>]\n"
+		"[-G <number of FIBs filled with the routes and looked up as "
+		"a group, ipv4 dir fib type only (default 1)>]\n"
 		"[-w <path to the file to dump routing table>]\n"
 		"[-u <path to the file to dump ip's for lookup>]\n"
 		"[-v <type of lookup function:"
@@ -663,6 +667,13 @@ check_config(void)
 		printf("-e 1 is valid only for ipv4\n");
 		return -1;
 	}
+
+	if ((config.nb_fibs > 1) && ((config.flags & (IPV6_FLAG | CMP_FLAG)) ||
+			((config.flags & FIB_TYPE_MASK) != FIB_V4_DIR_TYPE))) {
+		printf("-G is only valid for the ipv4 dir fib type, "
+			"without -c\n");
+		return -1;
+	}
 	return 0;
 }
 
@@ -672,7 +683,7 @@ parse_opts(int argc, char **argv)
 	int opt;
 	char *endptr;
 
-	while ((opt = getopt(argc, argv, "f:t:n:d:l:r:c6ab:e:g:w:u:sv:")) !=
+	while ((opt = getopt(argc, argv, "f:t:n:d:l:r:c6ab:e:g:G:w:u:sv:")) !=
 			-1) {
 		switch (opt) {
 		case 'f':
@@ -764,6 +775,15 @@ parse_opts(int argc, char **argv)
 				rte_exit(-EINVAL, "Invalid option -g\n");
 			}
 			break;
+		case 'G':
+			errno = 0;
+			config.nb_fibs = strtoul(optarg, &endptr, 10);
+			if ((errno != 0) || (config.nb_fibs == 0) ||
+					(config.nb_fibs > UINT16_MAX)) {
+				print_usage();
+				rte_exit(-EINVAL, "Invalid option -G\n");
+			}
+			break;
 		case 'v':
 			if ((strcmp(optarg, "s1") == 0) ||
 					(strcmp(optarg, "s") == 0)) {
@@ -815,6 +835,135 @@ print_depth_err(void)
 		"-d 0:0 option or remove /0 prefix from routes file\n");
 }
 
+/*
+ * Fill several FIBs of a group with the routes, the next hops being
+ * shifted by the FIB number, and look up every address in a FIB picked
+ * at random.
+ */
+static int
+run_v4_group(struct rte_fib_conf *conf)
+{
+	static const enum rte_fib_lookup_type lookup_types[] = {
+		RTE_FIB_LOOKUP_DEFAULT,
+		RTE_FIB_LOOKUP_DIR24_8_SCALAR_MACRO,
+		RTE_FIB_LOOKUP_DIR24_8_VECTOR_AVX512,
+		RTE_FIB_LOOKUP_DIR24_8_SCALAR_INLINE,
+		RTE_FIB_LOOKUP_DIR24_8_SCALAR_UNI,
+	};
+	uint64_t max_nh = get_max_nh(conf->dir24_8.nh_sz);
+	struct rt_rule_4 *rt = (struct rt_rule_4 *)config.rt;
+	struct rte_fib_group_conf grp_conf = {0};
+	uint32_t *tbl4 = config.lookup_tbl;
+	uint64_t fib_nh[BURST_SZ], nh;
+	char name[RTE_FIB_NAMESIZE];
+	struct rte_fib_group *grp;
+	struct rte_fib **fibs;
+	uint64_t start, acc;
+	uint16_t *fib_ids;
+	uint32_t i, j, n;
+	void **dps;
+	int ret;
+
+	grp_conf.type = conf->type;
+	grp_conf.flags = conf->flags;
+	grp_conf.dir24_8.nh_sz = conf->dir24_8.nh_sz;
+	grp = rte_fib_group_create(&grp_conf);
+	if (grp == NULL) {
+		printf("Can not alloc FIB group, err %d\n", rte_errno);
+		return -rte_errno;
+	}
+	conf->group = grp;
+
+	ret = rte_fib_group_select_lookup(grp, lookup_types[config.lookup_fn]);
+	if (ret != 0) {
+		printf("Can not init lookup function\n");
+		return ret;
+	}
+
+	fibs = rte_calloc(NULL, config.nb_fibs, sizeof(*fibs), 0);
+	fib_ids = rte_malloc(NULL, sizeof(*fib_ids) * config.nb_lookup_ips, 0);
+	dps = rte_malloc(NULL, sizeof(*dps) * config.nb_lookup_ips, 0);
+	if ((fibs == NULL) || (fib_ids == NULL) || (dps == NULL)) {
+		printf("Can not alloc the FIB group tables\n");
+		return -ENOMEM;
+	}
+
+	start = rte_rdtsc_precise();
+	for (j = 0; j < config.nb_fibs; j++) {
+		snprintf(name, sizeof(name), "test_%u", j);
+		fibs[j] = rte_fib_create(name, -1, conf);
+		if (fibs[j] == NULL) {
+			printf("Can not alloc FIB, err %d\n", rte_errno);
+			return -rte_errno;
+		}
+		for (i = 0; i < config.nb_routes; i++) {
+			ret = rte_fib_add(fibs[j], rt[i].addr, rt[i].depth,
+				(rt[i].nh + j) & max_nh);
+			if (unlikely(ret != 0)) {
+				printf("Can not add a route to FIB, err %d\n",
+					ret);
+				return -ret;
+			}
+		}
+	}
+	printf("AVG FIB add %"PRIu64"\n", (rte_rdtsc_precise() - start) /
+		((uint64_t)config.nb_fibs * config.nb_routes));
+
+	for (i = 0; i < config.nb_lookup_ips; i++) {
+		fib_ids[i] = rte_rand() % config.nb_fibs;
+		dps[i] = rte_fib_get_dp(fibs[fib_ids[i]]);
+	}
+
+	acc = 0;
+	for (i = 0; i < config.nb_lookup_ips; i += n) {
+		n = RTE_MIN(config.nb_lookup_ips - i, (uint32_t)BURST_SZ);
+		start = rte_rdtsc_precise();
+		ret = rte_fib_group_lookup_bulk(grp, dps + i, tbl4 + i,
+			fib_nh, n);
+		acc += rte_rdtsc_precise() - start;
+		if (ret != 0) {
+			printf("FIB lookup fails, err %d\n", ret);
+			return -ret;
+		}
+	}
+	printf("AVG FIB lookup %.1f\n", (double)acc / (double)i);
+
+	acc = 0;
+	for (i = 0; i < config.nb_lookup_ips; i += n) {
+		n = RTE_MIN(config.nb_lookup_ips - i, (uint32_t)BURST_SZ);
+		start = rte_rdtsc_precise();
+		for (j = 0; j < n; j++)
+			rte_fib_lookup_bulk(fibs[fib_ids[i + j]],
+				tbl4 + i + j, &fib_nh[j], 1);
+		acc += rte_rdtsc_precise() - start;
+	}
+	printf("AVG FIB lookup, one call per address %.1f\n",
+		(double)acc / (double)i);
+
+	for (i = 0; i < config.nb_lookup_ips; i += n) {
+		n = RTE_MIN(config.nb_lookup_ips - i, (uint32_t)BURST_SZ);
+		rte_fib_group_lookup_bulk(grp, dps + i, tbl4 + i, fib_nh, n);
+		for (j = 0; j < n; j++) {
+			rte_fib_lookup_bulk(fibs[fib_ids[i + j]],
+				tbl4 + i + j, &nh, 1);
+			if (nh != fib_nh[j]) {
+				printf("FAIL\n");
+				return -1;
+			}
+		}
+	}
+	printf("FIB group and single FIB lookups return same values\n");
+
+	for (j = 0; j < config.nb_fibs; j++)
+		rte_fib_free(fibs[j]);
+	rte_fib_group_free(grp);
+	rte_free(dps);
+	rte_free(fib_ids);
+	rte_free(fibs);
+
+	return 0;
+}
+
 static int
 run_v4(void)
 {
@@ -852,6 +1001,9 @@ run_v4(void)
 		conf.dir24_8.num_tbl8 = RTE_MIN(config.tbl8,
 			get_max_nh(conf.dir24_8.nh_sz));
 	}
+
+	if (config.nb_fibs > 1)
+		return run_v4_group(&conf);
 
 	fib = rte_fib_create("test", -1, &conf);
 	if (fib == NULL) {
