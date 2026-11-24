@@ -34,6 +34,7 @@ static int32_t test_drift_tight_pool(void);
 static int32_t test_tbl8_install_peak(void);
 static int32_t test_tbl8_install_peak_dq(void);
 static int32_t test_tbl8_dq_modify(void);
+static int32_t test_tbl8_pool_grow(void);
 
 #define MAX_ROUTES	(1 << 16)
 /** Maximum number of tbl8 for 2-byte entries */
@@ -1274,6 +1275,89 @@ test_tbl8_dq_modify(void)
 	return TEST_SUCCESS;
 }
 
+/*
+ * A resizable pool created with a single tbl8 group has to grow while
+ * prefixes needing several groups each are added. Every route must then
+ * resolve to its own next hop.
+ */
+static int32_t
+test_tbl8_pool_grow(void)
+{
+	struct rte_fib_tbl8_pool_conf pool_conf = {
+		.num_tbl8 = 1,
+		.max_tbl8 = 256,
+		.nh_sz = RTE_FIB6_TRIE_2B,
+		.socket_id = SOCKET_ID_ANY,
+	};
+	struct rte_fib_tbl8_pool_rcu_config rcu_cfg = { 0 };
+	struct rte_fib6_conf config = { 0 };
+	const unsigned int n_routes = 40;
+	struct rte_fib_tbl8_pool *pool;
+	struct rte_rcu_qsbr *qsv;
+	struct rte_ipv6_addr ip;
+	struct rte_fib6 *fib;
+	uint32_t total, used;
+	unsigned int i;
+	uint64_t nh;
+	size_t sz;
+	int ret;
+
+	config.max_routes = 1024;
+	config.default_nh = 0;
+	config.type = RTE_FIB6_TRIE;
+	config.trie.nh_sz = RTE_FIB6_TRIE_2B;
+
+	pool = rte_fib_tbl8_pool_create(__func__, &pool_conf);
+	RTE_TEST_ASSERT(pool != NULL, "Failed to create resizable pool\n");
+
+	sz = rte_rcu_qsbr_get_memsize(RTE_MAX_LCORE);
+	qsv = rte_zmalloc_socket(NULL, sz, RTE_CACHE_LINE_SIZE, SOCKET_ID_ANY);
+	RTE_TEST_ASSERT(qsv != NULL, "Can not allocate memory for RCU\n");
+	ret = rte_rcu_qsbr_init(qsv, RTE_MAX_LCORE);
+	RTE_TEST_ASSERT(ret == 0, "Can not initialize RCU\n");
+	rcu_cfg.v = qsv;
+	ret = rte_fib_tbl8_pool_rcu_qsbr_add(pool, &rcu_cfg);
+	RTE_TEST_ASSERT(ret == 0, "Can not attach RCU to pool (ret=%d)\n", ret);
+
+	config.trie.tbl8_pool = pool;
+	fib = rte_fib6_create(__func__, SOCKET_ID_ANY, &config);
+	RTE_TEST_ASSERT(fib != NULL, "Failed to create FIB\n");
+
+	for (i = 0; i < n_routes; i++) {
+		memset(&ip, 0, sizeof(ip));
+		ip.a[0] = 0x20;
+		ip.a[1] = 0x01;
+		ip.a[2] = i;
+		ret = rte_fib6_add(fib, &ip, 48, 0x100 + i);
+		RTE_TEST_ASSERT(ret == 0, "ADD /48 #%u failed (ret=%d)\n",
+			i, ret);
+	}
+
+	for (i = 0; i < n_routes; i++) {
+		memset(&ip, 0, sizeof(ip));
+		ip.a[0] = 0x20;
+		ip.a[1] = 0x01;
+		ip.a[2] = i;
+		ip.a[6] = 0x55;
+		rte_fib6_lookup_bulk(fib, &ip, &nh, 1);
+		RTE_TEST_ASSERT(nh == (uint64_t)(0x100 + i),
+			"lookup #%u got nh %" PRIu64 ", want %u\n",
+			i, nh, 0x100 + i);
+	}
+
+	ret = rte_fib_tbl8_pool_get_stats(pool, &used, &total, NULL);
+	RTE_TEST_ASSERT(ret == 0, "get_stats failed (ret=%d)\n", ret);
+	RTE_TEST_ASSERT(used == 3 * n_routes,
+		"expected %u tbl8 groups in use, got %u\n", 3 * n_routes, used);
+	RTE_TEST_ASSERT(total >= used && total > pool_conf.num_tbl8,
+		"pool did not grow, total=%u\n", total);
+
+	rte_fib6_free(fib);
+	rte_fib_tbl8_pool_free(pool);
+	rte_free(qsv);
+	return TEST_SUCCESS;
+}
+
 static struct unit_test_suite fib6_fast_tests = {
 	.suite_name = "fib6 autotest",
 	.setup = NULL,
@@ -1295,6 +1379,7 @@ static struct unit_test_suite fib6_fast_tests = {
 	TEST_CASE(test_tbl8_install_peak),
 	TEST_CASE(test_tbl8_install_peak_dq),
 	TEST_CASE(test_tbl8_dq_modify),
+	TEST_CASE(test_tbl8_pool_grow),
 	TEST_CASES_END()
 	}
 };
