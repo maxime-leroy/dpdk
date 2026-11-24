@@ -176,28 +176,27 @@ write_to_fib(void *ptr, uint64_t val, enum rte_fib_dir24_8_nh_sz size, int n)
 	}
 }
 
-static int
-tbl8_get_idx(struct dir24_8_tbl *dp)
+/*
+ * Get an index of a free tbl8 from the pool
+ */
+static inline int32_t
+tbl8_get(struct dir24_8_tbl *dp)
 {
-	uint32_t i;
-	int bit_idx;
+	if (dp->tbl8_pool_pos == dp->number_tbl8s)
+		/* no more free tbl8 */
+		return -ENOSPC;
 
-	for (i = 0; (i < (dp->number_tbl8s >> BITMAP_SLAB_BIT_SIZE_LOG2)) &&
-			(dp->tbl8_idxes[i] == UINT64_MAX); i++)
-		;
-	if (i < (dp->number_tbl8s >> BITMAP_SLAB_BIT_SIZE_LOG2)) {
-		bit_idx = rte_ctz64(~dp->tbl8_idxes[i]);
-		dp->tbl8_idxes[i] |= (1ULL << bit_idx);
-		return (i << BITMAP_SLAB_BIT_SIZE_LOG2) + bit_idx;
-	}
-	return -ENOSPC;
+	/* next index */
+	return dp->tbl8_pool[dp->tbl8_pool_pos++];
 }
 
+/*
+ * Put an index of a free tbl8 back to the pool
+ */
 static inline void
-tbl8_free_idx(struct dir24_8_tbl *dp, int idx)
+tbl8_put(struct dir24_8_tbl *dp, uint32_t tbl8_ind)
 {
-	dp->tbl8_idxes[idx >> BITMAP_SLAB_BIT_SIZE_LOG2] &=
-		~(1ULL << (idx & BITMAP_SLAB_BITMASK));
+	dp->tbl8_pool[--dp->tbl8_pool_pos] = tbl8_ind;
 }
 
 static int
@@ -206,12 +205,12 @@ tbl8_alloc(struct dir24_8_tbl *dp, uint64_t nh)
 	int64_t	tbl8_idx;
 	uint8_t	*tbl8_ptr;
 
-	tbl8_idx = tbl8_get_idx(dp);
+	tbl8_idx = tbl8_get(dp);
 
 	/* If there are no tbl8 groups try to reclaim one. */
 	if (unlikely(tbl8_idx == -ENOSPC && dp->dq &&
 			!rte_rcu_qsbr_dq_reclaim(dp->dq, 1, NULL, NULL, NULL)))
-		tbl8_idx = tbl8_get_idx(dp);
+		tbl8_idx = tbl8_get(dp);
 
 	if (tbl8_idx < 0)
 		return tbl8_idx;
@@ -222,7 +221,6 @@ tbl8_alloc(struct dir24_8_tbl *dp, uint64_t nh)
 	write_to_fib((void *)tbl8_ptr, nh|
 		DIR24_8_EXT_ENT, dp->nh_sz,
 		DIR24_8_TBL8_GRP_NUM_ENT);
-	dp->cur_tbl8s++;
 	return tbl8_idx;
 }
 
@@ -232,8 +230,7 @@ tbl8_cleanup_and_free(struct dir24_8_tbl *dp, uint64_t tbl8_idx)
 	uint8_t *ptr = (uint8_t *)dp->tbl8 + (tbl8_idx * DIR24_8_TBL8_GRP_NUM_ENT << dp->nh_sz);
 
 	memset(ptr, 0, DIR24_8_TBL8_GRP_NUM_ENT << dp->nh_sz);
-	tbl8_free_idx(dp, tbl8_idx);
-	dp->cur_tbl8s--;
+	tbl8_put(dp, tbl8_idx);
 }
 
 static void
@@ -337,14 +334,14 @@ install_to_fib(struct dir24_8_tbl *dp, uint32_t ledge, uint32_t redge,
 				 * needs tbl8 for ledge and redge.
 				 */
 				tbl8_idx = tbl8_alloc(dp, tbl24_tmp);
-				tmp_tbl8_idx = tbl8_get_idx(dp);
+				tmp_tbl8_idx = tbl8_get(dp);
 				if (tbl8_idx < 0)
 					return -ENOSPC;
 				else if (tmp_tbl8_idx < 0) {
-					tbl8_free_idx(dp, tbl8_idx);
+					tbl8_put(dp, tbl8_idx);
 					return -ENOSPC;
 				}
-				tbl8_free_idx(dp, tmp_tbl8_idx);
+				tbl8_put(dp, tmp_tbl8_idx);
 				/*update dir24 entry with tbl8 index*/
 				write_to_fib(get_tbl24_p(dp, ledge,
 					dp->nh_sz), (tbl8_idx << 1)|
@@ -567,7 +564,9 @@ dir24_8_create(const char *name, int socket_id, struct rte_fib_conf *fib_conf)
 	char mem_name[DIR24_8_NAMESIZE];
 	struct dir24_8_tbl *dp;
 	uint64_t	def_nh;
+	uint64_t	tbl8_sz;
 	uint32_t	num_tbl8;
+	uint32_t	i;
 	enum rte_fib_dir24_8_nh_sz	nh_sz;
 
 	if ((name == NULL) || (fib_conf == NULL) ||
@@ -584,8 +583,7 @@ dir24_8_create(const char *name, int socket_id, struct rte_fib_conf *fib_conf)
 
 	def_nh = fib_conf->default_nh;
 	nh_sz = fib_conf->dir24_8.nh_sz;
-	num_tbl8 = RTE_ALIGN_CEIL(fib_conf->dir24_8.num_tbl8,
-			BITMAP_SLAB_BIT_SIZE);
+	num_tbl8 = fib_conf->dir24_8.num_tbl8;
 
 	snprintf(mem_name, sizeof(mem_name), "DP_%s", name);
 	dp = rte_zmalloc_socket(name, sizeof(struct dir24_8_tbl) +
@@ -596,11 +594,8 @@ dir24_8_create(const char *name, int socket_id, struct rte_fib_conf *fib_conf)
 		return NULL;
 	}
 
-	/* Init table with default value */
-	write_to_fib(dp->tbl24, (def_nh << 1), nh_sz, 1 << 24);
-
 	snprintf(mem_name, sizeof(mem_name), "TBL8_%p", dp);
-	uint64_t tbl8_sz = DIR24_8_TBL8_GRP_NUM_ENT * (1ULL << nh_sz) *
+	tbl8_sz = DIR24_8_TBL8_GRP_NUM_ENT * (1ULL << nh_sz) *
 			(num_tbl8 + 1);
 	dp->tbl8 = rte_zmalloc_socket(mem_name, tbl8_sz,
 			RTE_CACHE_LINE_SIZE, socket_id);
@@ -614,15 +609,23 @@ dir24_8_create(const char *name, int socket_id, struct rte_fib_conf *fib_conf)
 	dp->number_tbl8s = num_tbl8;
 
 	snprintf(mem_name, sizeof(mem_name), "TBL8_idxes_%p", dp);
-	dp->tbl8_idxes = rte_zmalloc_socket(mem_name,
-			RTE_ALIGN_CEIL(dp->number_tbl8s, 64) >> 3,
+	dp->tbl8_pool = rte_zmalloc_socket(mem_name,
+			sizeof(uint32_t) * dp->number_tbl8s,
 			RTE_CACHE_LINE_SIZE, socket_id);
-	if (dp->tbl8_idxes == NULL) {
+	if (dp->tbl8_pool == NULL) {
 		rte_errno = ENOMEM;
 		rte_free(dp->tbl8);
 		rte_free(dp);
 		return NULL;
 	}
+
+	/* Init pool with all tbl8 indices free */
+	for (i = 0; i < dp->number_tbl8s; i++)
+		dp->tbl8_pool[i] = i;
+	dp->tbl8_pool_pos = 0;
+
+	/* Init table with default value */
+	write_to_fib(dp->tbl24, (def_nh << 1), nh_sz, 1 << 24);
 
 	return dp;
 }
@@ -633,7 +636,7 @@ dir24_8_free(void *p)
 	struct dir24_8_tbl *dp = (struct dir24_8_tbl *)p;
 
 	rte_rcu_qsbr_dq_delete(dp->dq);
-	rte_free(dp->tbl8_idxes);
+	rte_free(dp->tbl8_pool);
 	rte_free(dp->tbl8);
 	rte_free(dp);
 }
