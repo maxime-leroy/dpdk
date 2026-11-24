@@ -640,7 +640,7 @@ void
 setup_fib(const int socketid)
 {
 	struct rte_eth_dev_info dev_info;
-	struct rte_fib6_conf config;
+	struct rte_fib6_conf config = { 0 };
 	struct rte_fib_conf config_ipv4 = { 0 };
 	int i;
 	int ret;
